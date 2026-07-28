@@ -83,8 +83,13 @@ Rules:
 - Keep folio_no, registered_folio_no, certificate_no, distinctive_from and
   distinctive_to as STRINGS (preserve leading zeros exactly as printed).
 - no_of_shares must be an INTEGER (convert words like "ONE HUNDRED" to 100).
-- no_of_shares_words = the amount exactly as written in words on the document.
-- date_of_issue in ISO format YYYY-MM-DD.
+- no_of_shares_words = the amount exactly as written in words on the document
+  (keep trailing words like "ONLY" if printed, e.g. "FIVE ONLY").
+- date_of_issue in ISO format YYYY-MM-DD. The date line often ends with a
+  place name ("1ST DAY OF DECEMBER 1994 AT INDORE") - ignore the place.
+- share_holder_name: if several JOINT holders are listed one under another,
+  return ALL of them separated by " / ". Keep titles like MRS. Do NOT append
+  the postal address that often sits directly below the names.
 - latest_share_holder_name = the transferee/endorsed holder if the certificate
   shows a transfer/endorsement, else the registered holder.
 
@@ -95,11 +100,23 @@ These three are contractual add-ons - extract them carefully, do not skip them:
   "Folio No." on the counterfoil. If the certificate prints only ONE folio
   number anywhere, put that same value in BOTH folio_no and
   registered_folio_no. Only use null if no folio number is printed at all.
+  WARNING: many certificates print an extra UNLABELLED number between the
+  "Reg. Folio No." box and the "Certificate No." box (e.g. "Reg. Folio No.
+  8866    7866    Certificate No. 31013"). That middle number is an internal
+  ledger/transfer number. Ignore it - it is neither a folio nor the
+  certificate number. Folios may be alphanumeric (e.g. H3K12500); return them
+  as printed, never as a number.
 - face_value_per_share: the NOMINAL value of one share, normally printed as
   "Rs. 10/- each", "of Rs. 100 each fully paid up", "FV Rs. 2" or inside the
   capital clause. Return the per-share number only (10, not "Rs.10/-").
   If only a total paid-up amount is printed, divide it by no_of_shares and
   return that. Never copy no_of_shares into this field.
+  Do NOT confuse face value with the amount PAID UP. "EQUITY SHARES EACH OF
+  Rs. 10 ... AMOUNT PAID UP PER SHARE ON APPLICATION Rs. 5" means the face
+  value is 10, not 5. Likewise a preference share "EACH OF RUPEES 50/-" whose
+  paid-up value "stands reduced to RUPEES 30/-" has a face value of 50; the
+  reduction belongs in remarks. It is legitimate for the face value to happen
+  to equal the number of shares - do not second-guess a correct reading.
 - share_type: one of "Equity", "Preference", "Ordinary", "Redeemable
   Preference", "Bonus" - read it from the certificate heading
   (e.g. "EQUITY SHARE CERTIFICATE", "7% CUMULATIVE PREFERENCE SHARES").
@@ -107,8 +124,18 @@ These three are contractual add-ons - extract them carefully, do not skip them:
   "Equity" only when the body confirms equity, otherwise null.
 - remarks: any endorsement, transfer stamp, duplicate/lien note, split or
   consolidation note, or hand-written annotation on the face or reverse.
-  Empty string if the certificate is clean.
+  A large "ENDORSED" stamp across the holder block counts. So does a
+  conversion/redemption condition such as "converts into 2 equity shares of
+  Rs. 10 on redemption". Empty string if the certificate is clean.
 
+- Read digits with extra care in distinctive_from / distinctive_to. The count
+  of numbers in the range must equal no_of_shares, and the "to" number is
+  always GREATER than the "from" number. If your reading breaks either rule,
+  look at the digits again before answering. Preserve leading zeros exactly
+  (0001863752, not 1863752).
+- Certificate scans are often cropped at the edge. If the company name is cut
+  off, return the part you can actually read - do not invent the missing
+  words.
 - If any field is not readable, use null. DO NOT guess or hallucinate.
 """.format(keys=json.dumps(FIELDS, indent=2))
 

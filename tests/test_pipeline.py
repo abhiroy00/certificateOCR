@@ -111,6 +111,20 @@ def main() -> int:
                    distinctive_from="1", distinctive_to="5000")
     assert "Face value looks like the share count" in validate(swapped)
 
+    # FABWORTH is a real certificate for 50 preference shares of Rs 50 each,
+    # so face value == share count must NOT be flagged at this size
+    small = dict(clean_core, no_of_shares=50, face_value_per_share=50,
+                 distinctive_from="1", distinctive_to="50",
+                 share_type="Preference", registered_folio_no="054062")
+    assert validate(small) == "", validate(small)
+
+    # a distinctive range that runs backwards is reported as a misread digit,
+    # not as a negative span
+    backwards = dict(clean_core, no_of_shares=50, face_value_per_share=10,
+                     share_type="Preference", registered_folio_no="054062",
+                     distinctive_from="9210801", distinctive_to="9210650")
+    assert "runs backwards" in validate(backwards), validate(backwards)
+
     # 6) resume behaviour: kill half, requeue, finish
     p.q.conn.execute("UPDATE files SET status='running', claimed_at=0"
                      " WHERE id % 3 = 0")

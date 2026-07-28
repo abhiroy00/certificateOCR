@@ -14,6 +14,7 @@ ROOT = Path(__file__).resolve().parents[1]
 SUITES = [
     ("pipeline / queue / CSV", "tests.test_pipeline"),
     ("GUI (headless)", "tests.test_gui"),
+    ("golden sample certificates", "tests.test_golden"),
 ]
 
 

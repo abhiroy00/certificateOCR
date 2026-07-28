@@ -372,3 +372,48 @@ Optional, and only useful when running from source or on a server. Copy it
 to `.env` and fill in what you need. Desktop users should use the API key
 button instead - a keychain entry is safer than a text file. Never commit a
 real `.env`.
+
+## Ground truth from the four sample certificates
+
+tests/golden/ground_truth.json holds hand-verified values (read off the scans
+by eye, not by OCR) for the four samples: Kabra Drugs, Fabworth India,
+D & H Welding Electrodes and Tata Hydro-Electric. Each entry also lists the
+layout traps that certificate contains.
+
+Measure accuracy before quoting a number to a client:
+
+    python -m share_ocr.cli run C:\Users\vikal\Downloads\ocr
+    python -m share_ocr.cli export C:\temp\out.csv
+    python tools/check_accuracy.py C:\temp\out.csv
+
+You get a per-field percentage, a per-certificate breakdown, and every wrong
+value printed next to what it should have been. Leading zeros and LTD vs
+LIMITED are normalised; nothing else is forgiven.
+
+    python -m tests.test_golden
+
+runs the same ground truth through the validator to prove that a correctly
+read certificate produces zero flags.
+
+### What the samples changed
+
+* Face value equal to the share count is NOT an error. Fabworth is 50
+  preference shares of Rs 50 each. The rule now only fires on equality above
+  1000, plus a new flag for a face value outside the denominations Indian
+  companies actually used (1, 2, 5, 10, 20, 25, 50, 100, 500, 1000).
+* Kabra and D & H print an unlabelled ledger number between the folio and the
+  certificate number (8866 / 7866 / 31013). The prompt now ignores it.
+* Tata has three joint holders, an alphanumeric folio (H3K12500) and
+  distinctive numbers with four leading zeros. Joint holders are joined with
+  " / " and folios are never parsed as numbers.
+* Face value vs paid-up: Kabra is Rs 10 face with Rs 5 paid on application,
+  Fabworth is Rs 50 face reduced to Rs 30. The prompt distinguishes them and
+  sends the reduction to remarks.
+* Kabra's ENDORSED stamp and Fabworth's conversion condition belong in
+  remarks.
+* A distinctive range that runs backwards is reported as a misread digit.
+
+## User guide
+
+USER_GUIDE.md explains every button, dropdown and flag in plain language for
+the person operating the software. Ship it alongside the exe.

@@ -1,0 +1,111 @@
+{
+  "_about": [
+    "Hand-verified ground truth for the four sample certificates.",
+    "Read off the scans by eye, not by OCR. This is the yardstick: run",
+    "tools/check_accuracy.py against a real extraction CSV to get a",
+    "field-by-field accuracy score before quoting a client an accuracy %.",
+    "Add a new entry here every time a scan reveals a new layout quirk."
+  ],
+  "certificates": [
+    {
+      "source_file": "IMG-20260725-WA0006.jpg",
+      "company_name": "KABRA DRUGS LIMITED",
+      "share_type": "Equity",
+      "folio_no": "8866",
+      "registered_folio_no": "8866",
+      "certificate_no": "31013",
+      "share_holder_name": "YUNUSBHAI YAJUBBHAI PATEL",
+      "latest_share_holder_name": "YUNUSBHAI YAJUBBHAI PATEL",
+      "no_of_shares": 100,
+      "no_of_shares_words": "ONE HUNDRED",
+      "face_value_per_share": 10,
+      "distinctive_from": "4193501",
+      "distinctive_to": "4193600",
+      "date_of_issue": "1993-05-15",
+      "remarks_must_contain": "ENDORSED",
+      "_quirks": [
+        "A second unlabelled number (7866) sits between the Reg. Folio No.",
+        "and the Certificate No. It is a ledger/transfer number, NOT a folio.",
+        "Do not let it land in folio_no or registered_folio_no.",
+        "Large ENDORSED stamp across the holder block -> remarks.",
+        "Paid up Rs 5 on application out of Rs 10 face value: face value is",
+        "10, not 5."
+      ]
+    },
+    {
+      "source_file": "IMG-20260725-WA0007.jpg",
+      "company_name": "FABWORTH (INDIA) LTD.",
+      "share_type": "Redeemable Preference",
+      "folio_no": "054062",
+      "registered_folio_no": "054062",
+      "certificate_no": "00102911",
+      "share_holder_name": "D P PANJWANI",
+      "latest_share_holder_name": "D P PANJWANI",
+      "no_of_shares": 50,
+      "no_of_shares_words": "FIFTY",
+      "face_value_per_share": 50,
+      "distinctive_from": "09210801",
+      "distinctive_to": "09210850",
+      "date_of_issue": "1994-05-09",
+      "_quirks": [
+        "Face value (50) genuinely EQUALS the share count (50). Any rule that",
+        "flags fv == no_of_shares outright produces a false positive here.",
+        "10% Convertible Cumulative Redeemable Preference: share_type must not",
+        "come out as Equity.",
+        "Paid-up value stands reduced to Rs 30 and converts into 2 equity",
+        "shares of Rs 10 -> belongs in remarks, not in face_value_per_share.",
+        "Four stray numbers above the body text (0066395, 00001/00001,",
+        "064449, 05861000474) must not be mistaken for the folio.",
+        "Holder address block (MAHALLKSHMI OIL MILLS, INDORE) sits directly",
+        "under the name: address must not be appended to share_holder_name.",
+        "Heavy background guilloche pattern - the hardest of the four to read."
+      ]
+    },
+    {
+      "source_file": "IMG-20260725-WA0004.jpg",
+      "company_name": "D & H WELDING ELECTRODES (INDIA) LTD.",
+      "share_type": "Equity",
+      "folio_no": "9742",
+      "registered_folio_no": "9742",
+      "certificate_no": "39407",
+      "share_holder_name": "GOVIND PRAJAPATI",
+      "latest_share_holder_name": "GOVIND PRAJAPATI",
+      "no_of_shares": 100,
+      "no_of_shares_words": "ONE HUNDRED",
+      "face_value_per_share": 10,
+      "distinctive_from": "3940601",
+      "distinctive_to": "3940700",
+      "date_of_issue": "1994-12-01",
+      "_quirks": [
+        "Same unlabelled second number pattern as Kabra (10984).",
+        "Ampersand in the company name must survive as '&'.",
+        "Date reads '1ST DAY OF DECEMBER 1994 AT INDORE' - the trailing place",
+        "name must not break the date parse."
+      ]
+    },
+    {
+      "source_file": "IMG-20260725-WA0005.jpg",
+      "company_name": "THE TATA HYDRO-ELECTRIC POWER SUPPLY COMPANY LIMITED",
+      "share_type": "Ordinary",
+      "folio_no": "H3K12500",
+      "registered_folio_no": "H3K12500",
+      "certificate_no": "00102919",
+      "share_holder_name": "MRS KAUSAR R M H JUNG / MRS ADAM USMAN SHAIKH / QUDSIA ADAM SHAIKH",
+      "latest_share_holder_name": "MRS KAUSAR R M H JUNG / MRS ADAM USMAN SHAIKH / QUDSIA ADAM SHAIKH",
+      "no_of_shares": 5,
+      "no_of_shares_words": "FIVE ONLY",
+      "face_value_per_share": 100,
+      "distinctive_from": "0001863752",
+      "distinctive_to": "0001863756",
+      "date_of_issue": "1992-12-22",
+      "_quirks": [
+        "THREE joint holders in one block - all three must be captured.",
+        "Alphanumeric folio (H3K12500), so folio must never be parsed as int.",
+        "Distinctive numbers carry four leading zeros that must survive.",
+        "Company name is cropped on the left edge of the scan ('E TATA",
+        "HYDRO-ELECTRIC'): the model must reconstruct or the row is flagged.",
+        "Heading says ORDINARY (EQUITY) - either reading is defensible."
+      ]
+    }
+  ]
+}

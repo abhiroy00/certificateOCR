@@ -330,6 +330,13 @@ def build_engine(settings: Settings) -> BaseEngine:
     return cls(settings)
 
 
+# Denominations Indian companies actually issued shares in. Anything outside
+# this set is usually the model picking up a paid-up amount, a total, or a
+# stray number from elsewhere on the certificate.
+COMMON_FACE_VALUES = {1.0, 2.0, 5.0, 10.0, 20.0, 25.0, 50.0, 100.0, 500.0,
+                      1000.0}
+
+
 # ------------------------------------------------------------- validation --
 def validate(rec: Dict, flag_addons: bool = True) -> str:
     """Return a semicolon-joined string of validation flags (empty = clean).
@@ -342,9 +349,17 @@ def validate(rec: Dict, flag_addons: bool = True) -> str:
 
     # 1) share count must equal the distinctive-number span
     try:
-        span = (int(str(rec["distinctive_to"]).strip())
-                - int(str(rec["distinctive_from"]).strip()) + 1)
-        if rec.get("no_of_shares") is not None and span != int(rec["no_of_shares"]):
+        d_from = int(str(rec["distinctive_from"]).strip())
+        d_to = int(str(rec["distinctive_to"]).strip())
+        span = d_to - d_from + 1
+        if span <= 0:
+            # Impossible range: the 'to' number came out lower than the
+            # 'from'. In practice this is a single misread digit, so say so
+            # plainly instead of reporting a negative span.
+            flags.append(
+                f"Distinctive range runs backwards ({d_from} to {d_to}) "
+                "- likely a misread digit")
+        elif rec.get("no_of_shares") is not None and span != int(rec["no_of_shares"]):
             flags.append(
                 f"Share count {rec['no_of_shares']} != distinctive span {span}")
     except (TypeError, ValueError, KeyError):
@@ -370,12 +385,26 @@ def validate(rec: Dict, flag_addons: bool = True) -> str:
         if missing:
             flags.append("Add-on not captured: " + ", ".join(missing))
 
-    # 5) sanity on face value: it must never be the share count
+    # 5) sanity on face value.
+    #
+    # Careful here. The FABWORTH sample is a real certificate for 50
+    # preference shares of Rs 50 each - face value legitimately EQUALS the
+    # share count. So plain equality is not evidence of an error and flagging
+    # it produces false positives on exactly the kind of certificate a
+    # reviewer would waste time on.
+    #
+    # What IS suspicious:
+    #   a) equality on a large count (nobody issues 5,000 shares of Rs 5,000)
+    #   b) a face value that is not one of the denominations Indian companies
+    #      actually used
     fv, n = rec.get("face_value_per_share"), rec.get("no_of_shares")
-    if fv is not None and n is not None:
+    if fv is not None:
         try:
-            if float(fv) == float(n) and float(n) > 1000:
+            fvf = float(fv)
+            if n is not None and fvf == float(n) and float(n) > 1000:
                 flags.append("Face value looks like the share count")
+            elif fvf not in COMMON_FACE_VALUES:
+                flags.append(f"Unusual face value ({fv}) - check it")
         except (TypeError, ValueError):
             pass
 
