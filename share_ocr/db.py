@@ -133,18 +133,37 @@ class Queue:
         return n
 
     # ----------------------------------------------------------- claim --
-    def claim(self, limit: int, worker: str) -> List[sqlite3.Row]:
-        """Atomically move up to `limit` pending rows to running."""
+    def claim(self, limit: int, worker: str,
+              scope_ids: Optional[Sequence[int]] = None) -> List[sqlite3.Row]:
+        """Atomically move up to `limit` pending rows to running.
+
+        `scope_ids`, when given, restricts the claim to those file ids only
+        (the GUI's "Extract" uses this so it processes just what the
+        operator selected, not every pending/failed file ever queued). The
+        headless CLI never passes it, so the full resumable-queue behaviour
+        for the 30-lakh job is unchanged.
+        """
+        if scope_ids is not None and not scope_ids:
+            return []
         with self._claim_lock:
             conn = self.conn
             conn.row_factory = sqlite3.Row
             cur = conn.cursor()
             cur.execute("BEGIN IMMEDIATE")
-            rows = cur.execute(
-                "SELECT id, path, name FROM files WHERE status IN ('pending','failed')"
-                " ORDER BY id LIMIT ?",
-                (limit,),
-            ).fetchall()
+            if scope_ids is not None:
+                qs = ",".join("?" * len(scope_ids))
+                rows = cur.execute(
+                    f"SELECT id, path, name FROM files"
+                    f" WHERE status IN ('pending','failed') AND id IN ({qs})"
+                    f" ORDER BY id LIMIT ?",
+                    [*scope_ids, limit],
+                ).fetchall()
+            else:
+                rows = cur.execute(
+                    "SELECT id, path, name FROM files WHERE status IN ('pending','failed')"
+                    " ORDER BY id LIMIT ?",
+                    (limit,),
+                ).fetchall()
             if rows:
                 ids = [r["id"] for r in rows]
                 qs = ",".join("?" * len(ids))
@@ -155,6 +174,48 @@ class Queue:
                 )
             cur.execute("COMMIT")
             return rows
+
+    def resolve_ids(self, paths: Iterable[str]) -> List[int]:
+        """File ids for exact paths — used to scope a GUI run to only the
+        files under the operator's current selection."""
+        ids: List[int] = []
+        conn = self.conn
+        buf = list(paths)
+        chunk = 500
+        for i in range(0, len(buf), chunk):
+            part = buf[i:i + chunk]
+            qs = ",".join("?" * len(part))
+            ids += [r[0] for r in conn.execute(
+                f"SELECT id FROM files WHERE path IN ({qs})", part).fetchall()]
+        return ids
+
+    def counts_for(self, ids: Sequence[int]) -> Dict[str, int]:
+        """Same shape as counts(), but scoped to a specific set of file ids."""
+        out = {PENDING: 0, RUNNING: 0, DONE: 0, FAILED: 0, DEAD: 0}
+        if not ids:
+            out["total"] = 0
+            out["rows"] = 0
+            return out
+        conn = self.conn
+        chunk = 500
+        buf = list(ids)
+        for i in range(0, len(buf), chunk):
+            part = buf[i:i + chunk]
+            qs = ",".join("?" * len(part))
+            for status, n in conn.execute(
+                    f"SELECT status, COUNT(*) FROM files WHERE id IN ({qs})"
+                    f" GROUP BY status", part).fetchall():
+                out[status] = out.get(status, 0) + n
+        out["total"] = sum(v for k, v in out.items() if k != "total")
+        rows = 0
+        for i in range(0, len(buf), chunk):
+            part = buf[i:i + chunk]
+            qs = ",".join("?" * len(part))
+            rows += conn.execute(
+                f"SELECT COUNT(*) FROM results WHERE file_id IN ({qs})",
+                part).fetchone()[0]
+        out["rows"] = rows
+        return out
 
     def requeue_stale(self, older_than_s: float = 900) -> int:
         cur = self.conn.cursor()
@@ -253,6 +314,10 @@ class Queue:
             (limit,),
         ).fetchall()
 
+    def failed_or_dead_ids(self) -> List[int]:
+        return [r[0] for r in self.conn.execute(
+            "SELECT id FROM files WHERE status IN ('failed','dead')").fetchall()]
+
     def retry_failed(self) -> int:
         cur = self.conn.cursor()
         cur.execute(
@@ -260,6 +325,36 @@ class Queue:
             " WHERE status IN ('failed','dead')"
         )
         return cur.rowcount
+
+    def delete_results(self, row_ids: Sequence[int], requeue: bool = True) -> int:
+        """Remove specific extracted rows (the GUI's "Delete selected").
+
+        The source file is put back to 'pending' by default so a later
+        Extract pass can redo it instead of leaving a 'done' file with no
+        result row, which would otherwise be stuck forever (re-ingesting
+        the same path is a no-op because of the UNIQUE(path) constraint).
+        """
+        row_ids = list(row_ids)
+        if not row_ids:
+            return 0
+        conn = self.conn
+        cur = conn.cursor()
+        qs = ",".join("?" * len(row_ids))
+        cur.execute("BEGIN")
+        file_ids = [r[0] for r in cur.execute(
+            f"SELECT DISTINCT file_id FROM results WHERE row_id IN ({qs})",
+            row_ids).fetchall()]
+        cur.execute(f"DELETE FROM results WHERE row_id IN ({qs})", row_ids)
+        deleted = cur.rowcount
+        if requeue and file_ids:
+            fqs = ",".join("?" * len(file_ids))
+            cur.execute(
+                f"UPDATE files SET status='pending', attempts=0, error=NULL,"
+                f" updated_at=? WHERE id IN ({fqs})",
+                [time.time(), *file_ids],
+            )
+        cur.execute("COMMIT")
+        return deleted
 
     def reset_all(self) -> None:
         cur = self.conn.cursor()

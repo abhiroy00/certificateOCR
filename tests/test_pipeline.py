@@ -132,7 +132,7 @@ def main() -> int:
     assert requeued > 0
     assert p.q.counts()["pending"] == requeued
 
-    print(f"OK  {n} files → {c['rows']} rows → {len(shards)} CSV shard(s)")
+    print(f"OK  {n} files -> {c['rows']} rows -> {len(shards)} CSV shard(s)")
     print(f"    merged: {merged}")
     print(f"    resume: {requeued} stale rows re-queued")
     shutil.rmtree(tmp, ignore_errors=True)

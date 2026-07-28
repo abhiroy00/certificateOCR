@@ -91,9 +91,9 @@ def main() -> int:
 
     print()
     if hard_fail:
-        print("✗ GUI cannot start yet — fix the FAIL lines above.")
+        print("X GUI cannot start yet — fix the FAIL lines above.")
         return 1
-    print("✓ GUI can start.  Next:  python run_gui.py")
+    print("OK GUI can start.  Next:  python run_gui.py")
     return 0
 
 

@@ -517,7 +517,7 @@ class App:
         wrap.pack(fill="both", expand=True, pady=(px(8), 0))
         self._table_wrap = wrap
         self.tree = ttk.Treeview(wrap, columns=[c[0] for c in COLUMNS],
-                                 show="headings", selectmode="browse")
+                                 show="headings", selectmode="extended")
         for key, label, width in COLUMNS:
             self.tree.heading(key, text=label)
             self.tree.column(key, width=width, anchor="w",
@@ -534,6 +534,7 @@ class App:
         self.tree.tag_configure("addon", background=BLUE_TINT, foreground=INK)
         self.tree.tag_configure("odd", background=ZEBRA, foreground=INK)
         self.tree.bind("<Double-1>", self._open_source_file)
+        self.tree.bind("<Delete>", lambda e: self.delete_selected())
 
         foot = ttk.Frame(box, style="Card.TFrame")
         foot.pack(fill="x", pady=(px(9), 0))
@@ -544,6 +545,8 @@ class App:
                       command=self._open_output).pack(side="left", padx=px(8))
         RoundedButton(foot, text="Clear all", variant="danger", theme=t,
                    command=self.clear_all).pack(side="right")
+        RoundedButton(foot, text="Delete selected", variant="danger", theme=t,
+                   command=self.delete_selected).pack(side="right", padx=(0, px(8)))
 
     # -------------------------------------------------------- statusbar --
     def _build_statusbar(self) -> None:
@@ -655,8 +658,14 @@ class App:
     def _run_job(self) -> None:
         try:
             added = self.pipeline.ingest(self.selected_paths)
-            self._enqueue_log(f"{added:,} file(s) queued. Starting {self.s.workers} workers.")
-            self.pipeline.start()
+            # Scope this run to what is actually selected. Without this,
+            # Extract drains the whole resumable queue, so a single new
+            # file picked after an earlier selection left other files
+            # pending would silently reprocess those too.
+            scope_ids = self.pipeline.scope_ids_for(self.selected_paths)
+            self._enqueue_log(f"{added:,} file(s) queued. Starting {self.s.workers} workers "
+                              f"on {len(scope_ids):,} file(s) from this selection.")
+            self.pipeline.start(scope_ids=scope_ids)
             self.pipeline.join()
             self._enqueue_log("Finished.")
         except Exception as e:                        # noqa: BLE001
@@ -674,8 +683,30 @@ class App:
         self.status.configure(text="Stopping… (progress is saved, you can resume later)")
 
     def retry_failed(self) -> None:
+        ids = self.pipeline.q.failed_or_dead_ids()
+        if not ids:
+            messagebox.showinfo(APP_NAME, "No failed files to retry.")
+            return
+        if self.s.engine == "openai" and not resolve(self.s)[0]:
+            self.status.configure(text="Add an OpenAI API key to continue.")
+            self.open_api_key_dialog()
+            return
         n = self.pipeline.q.retry_failed()
-        messagebox.showinfo(APP_NAME, f"{n:,} failed file(s) re-queued.")
+        self.btn_extract.configure(state="disabled")
+        self.btn_stop.configure(state="normal")
+        self.btn_pause.configure(state="normal")
+        self.status.configure(text=f"Retrying {n:,} failed file(s)…")
+        threading.Thread(target=self._run_retry, args=(ids,), daemon=True).start()
+
+    def _run_retry(self, ids: List[int]) -> None:
+        try:
+            self.pipeline.start(scope_ids=ids)
+            self.pipeline.join()
+            self._enqueue_log("Retry finished.")
+        except Exception as e:                        # noqa: BLE001
+            self._enqueue_log(f"FATAL: {e}")
+        finally:
+            self.ui_queue.put(("finished", None))
 
     # ------------------------------------------------------ ui updates --
     def _enqueue_row(self, row: Dict) -> None:
@@ -727,8 +758,13 @@ class App:
             tags.append("flagged")     # amber: a core field failed validation
         elif self.row_count % 2:
             tags.append("odd")
+        # iid = the DB row_id (as a string) so a Treeview selection maps
+        # straight back to real rows for delete_selected(). Falls back to
+        # an auto-generated iid if a row somehow arrives without one.
+        row_id = row.get("row_id")
+        iid = str(row_id) if row_id is not None and not self.tree.exists(str(row_id)) else None
         self.tree.insert(
-            "", 0, values=(
+            "", 0, iid=iid, values=(
                 self.row_count, row.get("source_file", ""), row.get("company_name", ""),
                 row.get("folio_no", ""), row.get("registered_folio_no", ""),
                 row.get("certificate_no", ""), row.get("share_holder_name", ""),
@@ -773,6 +809,7 @@ class App:
                 continue
             rec["source_file"] = r["name"]
             rec["validation_flags"] = r["flags"]
+            rec["row_id"] = r["row_id"]
             self.row_count = shown
             self._insert_row(rec)
             shown = self.row_count
@@ -808,6 +845,40 @@ class App:
             return
         name = self.tree.item(sel[0], "values")[1]
         self.status.configure(text=f"Row source: {name}")
+
+    def delete_selected(self) -> None:
+        """Delete the checked/highlighted row(s): from the table, the CSV
+        shards and the queue database. The source file goes back to
+        'pending' so a later Extract can redo it if it's still needed."""
+        sel = self.tree.selection()
+        if not sel:
+            messagebox.showinfo(APP_NAME, "Select one or more rows first.")
+            return
+        row_ids: List[int] = []
+        for iid in sel:
+            try:
+                row_ids.append(int(iid))
+            except ValueError:
+                continue
+        if not row_ids:
+            return
+        n = len(row_ids)
+        if not messagebox.askyesno(
+                APP_NAME,
+                f"Delete {n} selected row(s)?\n\n"
+                "They are removed from the CSV output and the queue "
+                "database. The source file is put back to pending so "
+                "Extract can redo it if you still need that certificate."):
+            return
+        try:
+            self.pipeline.delete_rows(row_ids)
+        except Exception as e:                        # noqa: BLE001
+            messagebox.showerror(APP_NAME, str(e))
+            return
+        self.tree.delete(*sel)
+        self.row_count = max(0, self.row_count - n)
+        self.badge.configure(text=f"{self.row_count:,} record(s)")
+        self.status.configure(text=f"Deleted {n} row(s).")
 
     def clear_all(self) -> None:
         if not messagebox.askyesno(

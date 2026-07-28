@@ -94,6 +94,45 @@ class ShardedCsvWriter:
         self.flush()
 
     # ------------------------------------------------------------------
+    def remove_rows(self, row_ids) -> int:
+        """Physically drop rows with these row_id values from every shard
+        and the needs-review sidecar.
+
+        This is the GUI's interactive "Delete selected" action, not part
+        of the 3M-row bulk path — it rewrites whichever shard actually
+        contains a deleted id (shards are capped at `shard_rows`, 200k by
+        default, specifically so a rewrite like this stays cheap).
+        """
+        ids = {str(i) for i in row_ids}
+        if not ids:
+            return 0
+        with self._lock:
+            self._flush_locked()
+            removed = 0
+            for path in [*sorted(self.out_dir.glob(f"{self.prefix}-part-*.csv")),
+                         self._review_path()]:
+                removed += self._rewrite_without(path, ids)
+            self._rows_in_shard = self._count_rows(self._shard_path())
+            return removed
+
+    @staticmethod
+    def _rewrite_without(path: Path, ids: set) -> int:
+        if not path.exists():
+            return 0
+        with path.open("r", encoding="utf-8-sig", newline="") as f:
+            rows = list(csv.DictReader(f))
+        kept = [r for r in rows if r.get("row_id") not in ids]
+        removed = len(rows) - len(kept)
+        if removed == 0:
+            return 0
+        with path.open("w", encoding="utf-8-sig", newline="") as f:
+            w = csv.DictWriter(f, fieldnames=CSV_COLUMNS, extrasaction="ignore")
+            w.writeheader()
+            for r in kept:
+                w.writerow(r)
+        return removed
+
+    # ------------------------------------------------------------------
     def merge_into(self, dest: Path) -> Path:
         """Concatenate all shards into one CSV (only sane below ~1M rows,
         but handy for a single-batch export from the GUI)."""

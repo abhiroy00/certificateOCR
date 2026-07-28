@@ -113,6 +113,7 @@ class Pipeline:
         self._threads: List[threading.Thread] = []
         self._engines: Dict[int, object] = {}
         self._engine_lock = threading.Lock()
+        self._scope_ids: Optional[List[int]] = None
 
     # ---------------------------------------------------------- ingest --
     def ingest(self, roots: List[str], batch: Optional[str] = None) -> int:
@@ -125,6 +126,15 @@ class Pipeline:
         self.stats.total = c["total"]
         return added
 
+    def scope_ids_for(self, roots: List[str]) -> List[int]:
+        """File ids under these roots/paths, whether just-ingested or left
+        over pending from an earlier run of this same selection. Used to
+        scope a GUI Extract to what the operator actually picked, instead
+        of the entire historical backlog other selections may have left
+        pending."""
+        paths = [p for root in roots for p, _, _ in scan_paths(root)]
+        return self.q.resolve_ids(paths)
+
     # ----------------------------------------------------------- engine --
     def _engine(self):
         tid = threading.get_ident()
@@ -136,10 +146,20 @@ class Pipeline:
         return eng
 
     # ------------------------------------------------------------- run --
-    def start(self) -> None:
+    def start(self, scope_ids: Optional[List[int]] = None) -> None:
+        """Start the worker pool.
+
+        `scope_ids`, when given, restricts processing to those file ids
+        only (see scope_ids_for) — this is how the GUI's Extract avoids
+        silently reprocessing unrelated backlog left pending by an earlier,
+        different selection. Leave it None (the CLI's default) to drain
+        the whole resumable queue, which is what the 30-lakh multi-machine
+        job relies on.
+        """
         self._stop.clear()
+        self._scope_ids = list(scope_ids) if scope_ids is not None else None
         self.q.requeue_stale()
-        c = self.q.counts()
+        c = self.q.counts_for(self._scope_ids) if self._scope_ids is not None else self.q.counts()
         self.stats = Stats(total=c["total"], done=c[db.DONE], failed=c[db.DEAD])
         self._threads = [
             threading.Thread(target=self._worker, args=(i,), daemon=True,
@@ -159,7 +179,7 @@ class Pipeline:
     def join(self) -> None:
         for t in self._threads:
             t.join()
-        self.csv.flush()
+        self._safe_flush()
 
     @property
     def running(self) -> bool:
@@ -172,7 +192,8 @@ class Pipeline:
         while not self._stop.is_set():
             while self._pause.is_set() and not self._stop.is_set():
                 time.sleep(0.25)
-            rows = q.claim(self.s.claim_batch, worker=f"w{idx}")
+            rows = q.claim(self.s.claim_batch, worker=f"w{idx}",
+                          scope_ids=self._scope_ids)
             if not rows:
                 # DUPLICATE-ROW BUG (fixed): the old code probed for work with
                 # `q.claim(1)` and threw the result away. That row was already
@@ -207,18 +228,6 @@ class Pipeline:
                     rec, flag_addons=self.s.flag_missing_addons)
             latency = int((time.time() - t0) * 1000)
             row_ids = q.mark_done(file_id, records, engine.name, self.s.model, latency)
-            out_rows = [
-                record_to_row(rec, row_id=rid, name=name, path=path,
-                              engine=engine.name, model=self.s.model,
-                              latency_ms=latency)
-                for rid, rec in zip(row_ids, records)
-            ]
-            self.csv.write_many(out_rows)
-            q.mark_exported(row_ids)
-            self.stats.bump(done=1, rows=len(out_rows))
-            if self.on_row:
-                for row in out_rows:
-                    self.on_row(row)
         except Exception as e:                      # noqa: BLE001
             status = q.mark_failed(file_id, f"{type(e).__name__}: {e}",
                                    self.s.max_attempts)
@@ -233,17 +242,50 @@ class Pipeline:
                     "SELECT attempts FROM files WHERE id=?", (file_id,)
                 ).fetchone()[0])) + random.random()
                 time.sleep(min(60.0, delay))
+            return
+
+        # The extraction has already succeeded and is durably stored in the
+        # results table above. A CSV write failure here (classically: the
+        # shard file is open in Excel, which locks it on Windows) must NOT
+        # undo that or mark the file failed - it would put the file back in
+        # the pending/failed pool, get re-claimed on the next Extract click,
+        # and pay for the same OpenAI call again for data we already have.
+        out_rows = [
+            record_to_row(rec, row_id=rid, name=name, path=path,
+                          engine=engine.name, model=self.s.model,
+                          latency_ms=latency)
+            for rid, rec in zip(row_ids, records)
+        ]
+        try:
+            self.csv.write_many(out_rows)
+            q.mark_exported(row_ids)
+        except Exception as e:                      # noqa: BLE001
+            self.on_log(f"WARN {name}: extracted OK but CSV write failed "
+                       f"({type(e).__name__}: {e}) - close the CSV file if "
+                       "it is open in Excel. It writes automatically once "
+                       "the file is free again.")
+        self.stats.bump(done=1, rows=len(out_rows))
+        if self.on_row:
+            for row in out_rows:
+                self.on_row(row)
 
     # -------------------------------------------------------- reporter --
     def _reporter(self) -> None:
         while not self._stop.is_set() and self.running:
-            self.csv.flush()
+            self._safe_flush()
             if self.on_progress:
                 self.on_progress(self.stats)
             time.sleep(1.0)
-        self.csv.flush()
+        self._safe_flush()
         if self.on_progress:
             self.on_progress(self.stats)
+
+    def _safe_flush(self) -> None:
+        try:
+            self.csv.flush()
+        except Exception as e:                      # noqa: BLE001
+            self.on_log(f"WARN: CSV flush failed ({type(e).__name__}: {e}) - "
+                       "close the CSV file if it is open in Excel.")
 
     # ----------------------------------------------------------- misc --
     def counts(self) -> Dict[str, int]:
@@ -251,6 +293,15 @@ class Pipeline:
 
     def export_single_csv(self, dest: str) -> str:
         return str(self.csv.merge_into(Path(dest)))
+
+    def delete_rows(self, row_ids: List[int], requeue: bool = True) -> int:
+        """Remove specific extracted rows: DB, CSV shards, and (by default)
+        put the source file back to pending so Extract can redo it."""
+        if not row_ids:
+            return 0
+        deleted = self.q.delete_results(row_ids, requeue=requeue)
+        self.csv.remove_rows(row_ids)
+        return deleted
 
     def clear(self) -> None:
         self.q.reset_all()
