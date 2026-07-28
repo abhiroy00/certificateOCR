@@ -1,0 +1,20 @@
+# core
+openai>=1.30.0
+# Stores the API key in Windows Credential Manager / macOS Keychain /
+# Secret Service. Optional but strongly recommended - without it the key
+# falls back to an obfuscated 0600 file in the work folder.
+keyring>=24.0.0
+pillow>=10.0.0
+python-dotenv>=1.0.0
+
+# PDF support (also needs the poppler binary)
+pdf2image>=1.17.0
+
+# optional offline engine
+pytesseract>=0.3.10
+
+# optional drag & drop in the Tkinter window
+tkinterdnd2>=0.4.2
+
+# optional: only needed if you want an Excel export as well
+openpyxl>=3.1.0

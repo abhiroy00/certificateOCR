@@ -1,0 +1,261 @@
+"""The scalable worker pipeline.
+
+Flow
+----
+  scan(folder)  -> streams paths into the SQLite queue (no RAM blow-up)
+  Pipeline.run  -> N worker threads claim batches, call the engine,
+                   write results to SQLite AND stream rows into CSV shards
+
+Designed for 30 lakh (3,000,000) files:
+  * ingestion is O(1) memory, ~50k files/sec with os.scandir
+  * work is claimed in batches so SQLite locking is never the bottleneck
+  * every result is durable immediately -> kill the app anytime and resume
+  * exponential backoff + rate-limit awareness for API errors
+  * live throughput / ETA counters for the GUI
+"""
+from __future__ import annotations
+
+import logging
+import os
+import queue
+import random
+import threading
+import time
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Callable, Dict, Iterator, List, Optional, Tuple
+
+from . import db
+from .config import SUPPORTED_EXT, Settings
+from .csv_writer import ShardedCsvWriter, record_to_row
+from .extractor import build_engine, validate
+
+log = logging.getLogger("share_ocr")
+
+
+# ------------------------------------------------------------------ scan --
+def scan_paths(root: str, exts: Tuple[str, ...] = SUPPORTED_EXT) -> Iterator[Tuple[str, str, int]]:
+    """Recursively yield (path, name, size). Uses os.scandir -> constant memory."""
+    root_p = Path(root)
+    if root_p.is_file():
+        if root_p.suffix.lower() in exts:
+            yield str(root_p), root_p.name, root_p.stat().st_size
+        return
+
+    stack = [str(root_p)]
+    while stack:
+        current = stack.pop()
+        try:
+            with os.scandir(current) as it:
+                for entry in it:
+                    try:
+                        if entry.is_dir(follow_symlinks=False):
+                            stack.append(entry.path)
+                        elif entry.is_file(follow_symlinks=False):
+                            if os.path.splitext(entry.name)[1].lower() in exts:
+                                yield entry.path, entry.name, entry.stat().st_size
+                    except OSError:
+                        continue
+        except OSError:
+            continue
+
+
+# ----------------------------------------------------------------- stats --
+@dataclass
+class Stats:
+    total: int = 0
+    done: int = 0
+    failed: int = 0
+    rows: int = 0
+    started_at: float = field(default_factory=time.time)
+    _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
+
+    def bump(self, *, done: int = 0, failed: int = 0, rows: int = 0) -> None:
+        with self._lock:
+            self.done += done
+            self.failed += failed
+            self.rows += rows
+
+    @property
+    def elapsed(self) -> float:
+        return max(1e-6, time.time() - self.started_at)
+
+    @property
+    def rate(self) -> float:
+        """files per second"""
+        return (self.done + self.failed) / self.elapsed
+
+    @property
+    def eta_seconds(self) -> Optional[float]:
+        remaining = self.total - self.done - self.failed
+        if remaining <= 0 or self.rate <= 0:
+            return 0.0
+        return remaining / self.rate
+
+
+# -------------------------------------------------------------- pipeline --
+class Pipeline:
+    def __init__(self, settings: Settings,
+                 on_row: Optional[Callable[[Dict], None]] = None,
+                 on_progress: Optional[Callable[[Stats], None]] = None,
+                 on_log: Optional[Callable[[str], None]] = None):
+        self.s = settings
+        self.s.ensure_dirs()
+        self.q = db.Queue(self.s.db_path)
+        self.csv = ShardedCsvWriter(self.s.csv_dir, self.s.csv_shard_rows,
+                                    self.s.csv_flush_rows)
+        self.stats = Stats()
+        self.on_row = on_row
+        self.on_progress = on_progress
+        self.on_log = on_log or (lambda m: log.info(m))
+        self._stop = threading.Event()
+        self._pause = threading.Event()
+        self._threads: List[threading.Thread] = []
+        self._engines: Dict[int, object] = {}
+        self._engine_lock = threading.Lock()
+
+    # ---------------------------------------------------------- ingest --
+    def ingest(self, roots: List[str], batch: Optional[str] = None) -> int:
+        batch = batch or time.strftime("%Y%m%d-%H%M%S")
+        added = 0
+        for root in roots:
+            added += self.q.add_files(scan_paths(root), batch)
+            self.on_log(f"Indexed {root} -> {added:,} new file(s) queued")
+        c = self.q.counts()
+        self.stats.total = c["total"]
+        return added
+
+    # ----------------------------------------------------------- engine --
+    def _engine(self):
+        tid = threading.get_ident()
+        eng = self._engines.get(tid)
+        if eng is None:
+            with self._engine_lock:
+                eng = build_engine(self.s)
+                self._engines[tid] = eng
+        return eng
+
+    # ------------------------------------------------------------- run --
+    def start(self) -> None:
+        self._stop.clear()
+        self.q.requeue_stale()
+        c = self.q.counts()
+        self.stats = Stats(total=c["total"], done=c[db.DONE], failed=c[db.DEAD])
+        self._threads = [
+            threading.Thread(target=self._worker, args=(i,), daemon=True,
+                             name=f"ocr-{i}")
+            for i in range(self.s.workers)
+        ]
+        for t in self._threads:
+            t.start()
+        threading.Thread(target=self._reporter, daemon=True, name="reporter").start()
+
+    def stop(self) -> None:
+        self._stop.set()
+
+    def pause(self, value: bool = True) -> None:
+        self._pause.set() if value else self._pause.clear()
+
+    def join(self) -> None:
+        for t in self._threads:
+            t.join()
+        self.csv.flush()
+
+    @property
+    def running(self) -> bool:
+        return any(t.is_alive() for t in self._threads)
+
+    # --------------------------------------------------------- workers --
+    def _worker(self, idx: int) -> None:
+        q = db.Queue(self.s.db_path)   # thread-local connection
+        idle_rounds = 0
+        while not self._stop.is_set():
+            while self._pause.is_set() and not self._stop.is_set():
+                time.sleep(0.25)
+            rows = q.claim(self.s.claim_batch, worker=f"w{idx}")
+            if not rows:
+                # DUPLICATE-ROW BUG (fixed): the old code probed for work with
+                # `q.claim(1)` and threw the result away. That row was already
+                # flipped to 'running' with nobody processing it, so
+                # requeue_stale() later handed the same file to another worker
+                # and it was extracted TWICE - two identical rows in the table
+                # and in the CSV. Never claim what you are not going to run.
+                idle_rounds += 1
+                if idle_rounds >= 2:
+                    break
+                time.sleep(0.5)
+                continue
+            idle_rounds = 0
+            for r in rows:
+                if self._stop.is_set():
+                    # give unfinished work back to the queue
+                    q.conn.execute(
+                        "UPDATE files SET status='pending' WHERE id=? AND status='running'",
+                        (r["id"],))
+                    q.conn.commit()
+                    continue
+                self._process_one(q, r["id"], r["path"], r["name"])
+        q.close()
+
+    def _process_one(self, q: db.Queue, file_id: int, path: str, name: str) -> None:
+        t0 = time.time()
+        try:
+            engine = self._engine()
+            records = engine.extract_file(path)
+            for rec in records:
+                rec["validation_flags"] = validate(
+                    rec, flag_addons=self.s.flag_missing_addons)
+            latency = int((time.time() - t0) * 1000)
+            row_ids = q.mark_done(file_id, records, engine.name, self.s.model, latency)
+            out_rows = [
+                record_to_row(rec, row_id=rid, name=name, path=path,
+                              engine=engine.name, model=self.s.model,
+                              latency_ms=latency)
+                for rid, rec in zip(row_ids, records)
+            ]
+            self.csv.write_many(out_rows)
+            q.mark_exported(row_ids)
+            self.stats.bump(done=1, rows=len(out_rows))
+            if self.on_row:
+                for row in out_rows:
+                    self.on_row(row)
+        except Exception as e:                      # noqa: BLE001
+            status = q.mark_failed(file_id, f"{type(e).__name__}: {e}",
+                                   self.s.max_attempts)
+            if status == db.DEAD:
+                self.stats.bump(failed=1)
+            self.on_log(f"ERROR {name}: {type(e).__name__}: {e}")
+            # backoff on rate limits / transient network failures
+            msg = str(e).lower()
+            if any(k in msg for k in ("rate limit", "429", "timeout", "connection",
+                                      "overloaded", "503", "502")):
+                delay = self.s.retry_base_delay * (2 ** min(4, q.conn.execute(
+                    "SELECT attempts FROM files WHERE id=?", (file_id,)
+                ).fetchone()[0])) + random.random()
+                time.sleep(min(60.0, delay))
+
+    # -------------------------------------------------------- reporter --
+    def _reporter(self) -> None:
+        while not self._stop.is_set() and self.running:
+            self.csv.flush()
+            if self.on_progress:
+                self.on_progress(self.stats)
+            time.sleep(1.0)
+        self.csv.flush()
+        if self.on_progress:
+            self.on_progress(self.stats)
+
+    # ----------------------------------------------------------- misc --
+    def counts(self) -> Dict[str, int]:
+        return self.q.counts()
+
+    def export_single_csv(self, dest: str) -> str:
+        return str(self.csv.merge_into(Path(dest)))
+
+    def clear(self) -> None:
+        self.q.reset_all()
+        for p in self.s.csv_dir.glob("*.csv"):
+            p.unlink(missing_ok=True)
+        self.csv = ShardedCsvWriter(self.s.csv_dir, self.s.csv_shard_rows,
+                                    self.s.csv_flush_rows)
+        self.stats = Stats()

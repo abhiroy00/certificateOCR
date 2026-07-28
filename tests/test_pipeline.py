@@ -1,0 +1,129 @@
+"""End-to-end smoke test using the test-only stub engine.
+
+    python -m tests.test_pipeline
+"""
+from __future__ import annotations
+
+import csv
+import shutil
+import sys
+import tempfile
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from PIL import Image  # noqa: E402
+
+from share_ocr.config import Settings  # noqa: E402
+from share_ocr.extractor import validate  # noqa: E402
+from share_ocr.pipeline import Pipeline, scan_paths  # noqa: E402
+from tests.stub_engine import install as install_stub  # noqa: E402
+
+
+def make_fixtures(root: Path, n: int) -> None:
+    root.mkdir(parents=True, exist_ok=True)
+    for i in range(n):
+        sub = root / f"box{i % 5}"
+        sub.mkdir(exist_ok=True)
+        Image.new("RGB", (600, 400), (240, 240, 250)).save(sub / f"cert_{i:05d}.jpg")
+
+
+def main() -> int:
+    tmp = Path(tempfile.mkdtemp(prefix="share_ocr_test_"))
+    scans = tmp / "scans"
+    n = 120
+    make_fixtures(scans, n)
+
+    s = Settings()
+    s.workdir = tmp / "home"
+    s.engine = install_stub()
+    s.workers = 6
+    s.claim_batch = 10
+    s.csv_flush_rows = 25
+    s.csv_shard_rows = 50           # force multiple shards
+    s.ensure_dirs()
+
+    # 1) scanner finds everything, recursively
+    found = list(scan_paths(str(scans)))
+    assert len(found) == n, f"scan found {len(found)} of {n}"
+
+    # 2) run the pipeline
+    p = Pipeline(s, on_log=lambda m: None)
+    added = p.ingest([str(scans)])
+    assert added == n, f"ingest queued {added} of {n}"
+    p.start()
+    p.join()
+
+    c = p.counts()
+    assert c["done"] == n, c
+    assert c["rows"] == n, c
+
+    # 3) idempotent re-ingest (no duplicates)
+    assert p.ingest([str(scans)]) == 0, "re-ingest created duplicates"
+
+    # 4) CSV shards written and mergeable
+    shards = sorted(s.csv_dir.glob("certificates-part-*.csv"))
+    assert len(shards) >= 2, f"expected shards, got {shards}"
+    merged = p.export_single_csv(str(tmp / "certificates.csv"))
+    with open(merged, encoding="utf-8-sig", newline="") as f:
+        rows = list(csv.DictReader(f))
+    assert len(rows) == n, f"merged csv has {len(rows)} rows"
+    assert rows[0]["company_name"].startswith("TEST COMPANY"), rows[0]["company_name"]
+    assert rows[0]["distinctive_from"].isdigit(), rows[0]["distinctive_from"]
+    assert rows[0]["validation_flags"] == ""
+
+    # 4b) the three billed add-ons must be present as CSV columns AND populated
+    for col in ("face_value_per_share", "share_type", "registered_folio_no",
+                "remarks"):
+        assert col in rows[0], f"add-on column {col} missing from CSV"
+    assert rows[0]["face_value_per_share"] == "10", rows[0]["face_value_per_share"]
+    assert rows[0]["share_type"] == "Equity", rows[0]["share_type"]
+    assert rows[0]["registered_folio_no"] == rows[0]["folio_no"], rows[0]
+
+    # 5) validation logic
+    bad = {"company_name": "X", "certificate_no": "1", "share_holder_name": "Y",
+           "no_of_shares": 100, "distinctive_from": "1", "distinctive_to": "50",
+           "date_of_issue": "15-05-1993"}
+    flags = validate(bad)
+    assert "distinctive span" in flags and "Bad date format" in flags, flags
+
+    clean_core = {"distinctive_from": "1", "distinctive_to": "100",
+                  "no_of_shares": 100, "company_name": "A",
+                  "certificate_no": "B", "share_holder_name": "C",
+                  "date_of_issue": "1993-05-15"}
+
+    # add-ons missing -> soft flag naming exactly which ones
+    soft = validate(clean_core)
+    assert soft.startswith("Add-on not captured"), soft
+    for f in ("face_value_per_share", "share_type", "registered_folio_no"):
+        assert f in soft, soft
+
+    # add-ons switched off -> clean
+    assert validate(clean_core, flag_addons=False) == ""
+
+    # add-ons present -> clean
+    full = dict(clean_core, face_value_per_share=10, share_type="Equity",
+                registered_folio_no="8866")
+    assert validate(full) == "", validate(full)
+
+    # face value must never be the share count
+    swapped = dict(full, no_of_shares=5000, face_value_per_share=5000,
+                   distinctive_from="1", distinctive_to="5000")
+    assert "Face value looks like the share count" in validate(swapped)
+
+    # 6) resume behaviour: kill half, requeue, finish
+    p.q.conn.execute("UPDATE files SET status='running', claimed_at=0"
+                     " WHERE id % 3 = 0")
+    requeued = p.q.requeue_stale(older_than_s=1)
+    assert requeued > 0
+    assert p.q.counts()["pending"] == requeued
+
+    print(f"OK  {n} files → {c['rows']} rows → {len(shards)} CSV shard(s)")
+    print(f"    merged: {merged}")
+    print(f"    resume: {requeued} stale rows re-queued")
+    shutil.rmtree(tmp, ignore_errors=True)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
