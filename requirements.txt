@@ -7,7 +7,10 @@ keyring>=24.0.0
 pillow>=10.0.0
 python-dotenv>=1.0.0
 
-# PDF support (also needs the poppler binary)
+# PDF support - either works, PyMuPDF is the easier one to get running:
+#   pymupdf    : pure pip wheel, no extra install, works out of the box
+#   pdf2image  : needs the poppler binary on PATH too (see README)
+pymupdf>=1.24.0
 pdf2image>=1.17.0
 
 # optional offline engine

@@ -23,7 +23,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional
 
-from .config import ADDON_FIELDS, FIELDS, PROMPT, Settings
+from .config import ADDON_FIELDS, FIELDS, PROMPT, PROMPT_MULTI_PAGE, Settings
 from .secrets import get_api_key
 
 
@@ -47,15 +47,48 @@ def downscale_to_jpeg_b64(path: str, max_px: int, quality: int) -> str:
 
 
 def pdf_to_images(pdf_path: str, dpi: int) -> List[str]:
-    from pdf2image import convert_from_path
+    """Render each PDF page to a JPEG on disk, one per page.
 
-    out: List[str] = []
+    Two renderers are supported:
+      * pdf2image + poppler - what the README tells people to install, used
+        when the poppler binaries (pdftoppm/pdftocairo) are actually on PATH.
+      * PyMuPDF (pip install pymupdf) - a pure pip wheel with no external
+        binary to install, so PDFs still work out of the box on a fresh
+        Windows machine where nobody has set up poppler yet.
+    """
     tmpdir = Path(tempfile.gettempdir()) / "share_ocr_pdf"
     tmpdir.mkdir(parents=True, exist_ok=True)
-    for i, page in enumerate(convert_from_path(pdf_path, dpi=dpi)):
-        p = tmpdir / f"{Path(pdf_path).stem}_{os.getpid()}_p{i}.jpg"
-        page.save(p, "JPEG", quality=85)
-        out.append(str(p))
+
+    if shutil.which("pdftoppm") or shutil.which("pdftocairo"):
+        from pdf2image import convert_from_path
+        out: List[str] = []
+        for i, page in enumerate(convert_from_path(pdf_path, dpi=dpi)):
+            p = tmpdir / f"{Path(pdf_path).stem}_{os.getpid()}_p{i}.jpg"
+            page.save(p, "JPEG", quality=85)
+            out.append(str(p))
+        return out
+
+    try:
+        import fitz  # PyMuPDF
+    except ImportError as e:
+        raise RuntimeError(
+            "Cannot read PDFs: poppler is not on PATH and PyMuPDF is not "
+            "installed. Run 'pip install pymupdf' (no extra setup needed), "
+            "or install poppler - see README for platform instructions."
+        ) from e
+
+    out = []
+    zoom = dpi / 72.0
+    matrix = fitz.Matrix(zoom, zoom)
+    doc = fitz.open(pdf_path)
+    try:
+        for i, page in enumerate(doc):
+            pix = page.get_pixmap(matrix=matrix)
+            p = tmpdir / f"{Path(pdf_path).stem}_{os.getpid()}_p{i}.jpg"
+            pix.save(str(p))
+            out.append(str(p))
+    finally:
+        doc.close()
     return out
 
 
@@ -77,29 +110,53 @@ def make_thumbnail(path: str, dest: Path, size: int = 160) -> Optional[str]:
 class BaseEngine:
     name = "base"
 
+    # A physical certificate scanned to PDF is normally 1-2 pages (front,
+    # optionally its own reverse). A PDF with more pages than this is
+    # presumed to be a genuine multi-certificate batch scan instead, so it
+    # falls back to one row per page rather than being forced into one
+    # record.
+    MAX_PAGES_PER_CERTIFICATE = 4
+
     def __init__(self, settings: Settings):
         self.s = settings
 
     def extract_image(self, image_path: str) -> Dict:  # pragma: no cover
         raise NotImplementedError
 
+    def extract_document(self, image_paths: List[str]) -> Dict:
+        """Extract one record from every page of a single certificate.
+
+        Default: only the front page (the first image) is authoritative;
+        used by engines that cannot reason across multiple images at once.
+        Vision-LLM engines override this to actually read every page.
+        """
+        return self.extract_image(image_paths[0])
+
     def extract_file(self, path: str) -> List[Dict]:
         """Handle images and multi-page PDFs uniformly."""
-        records: List[Dict] = []
-        if path.lower().endswith(".pdf"):
-            for i, img in enumerate(pdf_to_images(path, self.s.pdf_dpi), start=1):
+        if not path.lower().endswith(".pdf"):
+            rec = self.extract_image(path)
+            rec["page_no"] = 1
+            return [rec]
+
+        imgs = pdf_to_images(path, self.s.pdf_dpi)
+        try:
+            if imgs and len(imgs) <= self.MAX_PAGES_PER_CERTIFICATE:
+                rec = self.extract_document(imgs)
+                rec["page_no"] = 1
+                return [rec]
+            records: List[Dict] = []
+            for i, img in enumerate(imgs, start=1):
                 rec = self.extract_image(img)
                 rec["page_no"] = i
                 records.append(rec)
+            return records
+        finally:
+            for img in imgs:
                 try:
                     os.remove(img)
                 except OSError:
                     pass
-        else:
-            rec = self.extract_image(path)
-            rec["page_no"] = 1
-            records.append(rec)
-        return records
 
 
 class OpenAIEngine(BaseEngine):
@@ -139,6 +196,27 @@ class OpenAIEngine(BaseEngine):
                                    "detail": "high"}},
                 ],
             }],
+        )
+        data = json.loads(resp.choices[0].message.content)
+        return {k: data.get(k) for k in FIELDS}
+
+    def extract_document(self, image_paths: List[str]) -> Dict:
+        """Read every page of one certificate in a single request, so a
+        reverse-side "Memorandum of Transfers" page is read as part of the
+        same certificate instead of being force-fit into its own row."""
+        if len(image_paths) == 1:
+            return self.extract_image(image_paths[0])
+        content: List[Dict] = [{"type": "text", "text": PROMPT_MULTI_PAGE}]
+        for p in image_paths:
+            b64 = downscale_to_jpeg_b64(p, self.s.max_image_px, self.s.jpeg_quality)
+            content.append({"type": "image_url",
+                            "image_url": {"url": f"data:image/jpeg;base64,{b64}",
+                                          "detail": "high"}})
+        resp = self.client.chat.completions.create(
+            model=self.s.model,
+            temperature=0,
+            response_format={"type": "json_object"},
+            messages=[{"role": "user", "content": content}],
         )
         data = json.loads(resp.choices[0].message.content)
         return {k: data.get(k) for k in FIELDS}
@@ -313,6 +391,35 @@ class TesseractEngine(BaseEngine):
             rec["registered_folio_no"] = rec["folio_no"]
 
         rec["_raw_text"] = text[:2000]
+        return rec
+
+    def extract_document(self, image_paths: List[str]) -> Dict:
+        """Front page is authoritative for every structured field. Later
+        pages (typically the certificate's own reverse - a "Memorandum of
+        Transfers" ledger) cannot be reasoned about the way a vision LLM
+        can, but their OCR text is still scanned for endorsement keywords
+        so that note isn't silently lost."""
+        rec = self.extract_image(image_paths[0])
+        extra_notes = []
+        for img in image_paths[1:]:
+            import pytesseract
+            from PIL import Image, ImageOps
+
+            with Image.open(img) as im:
+                im = ImageOps.exif_transpose(im).convert("L")
+                text = pytesseract.image_to_string(im)
+            low = text.lower()
+            extra_notes += [label for pat, label in self.REMARK_PATTERNS
+                           if re.search(pat, low, re.I)]
+            if re.search(r"memorandum\s+of\s+transfers?", low, re.I):
+                extra_notes.append("Transfer(s) recorded on reverse")
+        if extra_notes:
+            existing = rec.get("remarks") or ""
+            merged = "; ".join(dict.fromkeys(
+                [n for n in existing.split("; ") if n] + extra_notes))
+            rec["remarks"] = merged
+        rec["latest_share_holder_name"] = (
+            rec.get("latest_share_holder_name") or rec.get("share_holder_name"))
         return rec
 
 

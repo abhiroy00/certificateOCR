@@ -57,7 +57,10 @@ def main() -> int:
     if not check_module("PIL", True, "pip install pillow"):
         hard_fail = True
     check_module("openai", False, "pip install openai — only needed for the openai engine")
-    check_module("pdf2image", False, "pip install pdf2image — only needed for PDFs")
+    have_pymupdf = check_module("fitz", False, "pip install pymupdf — reads PDFs, "
+                                                "no extra install needed")
+    have_pdf2image = check_module("pdf2image", False, "pip install pdf2image — reads "
+                                                       "PDFs, but also needs poppler on PATH")
     check_module("pytesseract", False, "pip install pytesseract — only for the offline engine")
     check_module("tkinterdnd2", False, "pip install tkinterdnd2 — enables drag & drop "
                                        "(click-to-select still works without it)")
@@ -65,10 +68,17 @@ def main() -> int:
                                    "OS credential store instead of a local file")
 
     # --- external binaries ----------------------------------------------
-    for exe, why in (("pdftoppm", "poppler, needed for PDF input"),
-                     ("tesseract", "needed only for the offline engine")):
-        path = shutil.which(exe)
-        line(OK if path else WARN, exe, path or f"not found — {why}")
+    have_poppler = bool(shutil.which("pdftoppm") or shutil.which("pdftocairo"))
+    line(OK if have_poppler else WARN, "poppler",
+        shutil.which("pdftoppm") or "not found — only needed if you rely on pdf2image "
+                                    "instead of pymupdf for PDF input")
+    line(OK if shutil.which("tesseract") else WARN, "tesseract",
+        shutil.which("tesseract") or "not found — needed only for the offline engine")
+    line(OK if (have_pymupdf or (have_pdf2image and have_poppler)) else WARN,
+        "PDF input", "ready via " + (
+            "pymupdf" if have_pymupdf else "pdf2image + poppler"
+        ) if (have_pymupdf or (have_pdf2image and have_poppler))
+        else "not available — run 'pip install pymupdf' for the simplest fix")
 
     # --- API key ----------------------------------------------------------
     try:
