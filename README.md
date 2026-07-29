@@ -17,10 +17,8 @@ python -m venv .venv
 source .venv/bin/activate          # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
 
-# PDF support needs poppler
-#   Ubuntu : sudo apt install poppler-utils
-#   Mac    : brew install poppler
-#   Windows: download poppler and add /bin to PATH
+# PDF support is included (pypdfium2, in requirements.txt - no extra download).
+# Poppler is optional and only used as a fallback if it is already installed.
 
 # offline engine (optional)
 #   Ubuntu : sudo apt install tesseract-ocr

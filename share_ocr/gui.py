@@ -137,8 +137,16 @@ class App:
 
         self._build_toolbar()
         self._build_dropzone()
-        self._build_results()
+        # The status bar is built BEFORE the results card and anchored to the
+        # bottom edge. Tk's packer hands each widget its requested size in
+        # packing order and only shares out the surplus afterwards, so the
+        # results table - which asks for a lot and expands - used to consume
+        # the whole cavity and leave nothing for whatever came after it. On a
+        # 1080p screen that pushed the status bar AND the row buttons
+        # (Select all / Delete selected / Clear all / Download CSV) off the
+        # bottom of the window entirely, so they looked like missing features.
         self._build_statusbar()
+        self._build_results()
         self._restore_counts()
 
         # Sizing last, so requested widget sizes are known.
@@ -513,11 +521,23 @@ class App:
         # nothing is selected was the single biggest band of dead space.
         self.thumb_bar = tk.Frame(box, bg=CARD)
 
+        # The row-action buttons are created and anchored to the bottom of
+        # the card BEFORE the table, so the table can only ever expand into
+        # what is left over. Packed after the table (as they were), they were
+        # the first thing Tk dropped when the window was shorter than the
+        # content, and "Delete selected" / "Clear all" simply vanished.
+        foot = ttk.Frame(box, style="Card.TFrame")
+        foot.pack(side="bottom", fill="x", pady=(px(9), 0))
+
         wrap = ttk.Frame(box, style="Card.TFrame")
         wrap.pack(fill="both", expand=True, pady=(px(8), 0))
         self._table_wrap = wrap
+        # A modest requested height: the table expands to fill the window
+        # anyway, and a large default inflated winfo_reqheight() enough to
+        # drive the computed minimum window size past the screen.
         self.tree = ttk.Treeview(wrap, columns=[c[0] for c in COLUMNS],
-                                 show="headings", selectmode="extended")
+                                 show="headings", selectmode="extended",
+                                 height=6)
         for key, label, width in COLUMNS:
             self.tree.heading(key, text=label)
             self.tree.column(key, width=width, anchor="w",
@@ -535,9 +555,9 @@ class App:
         self.tree.tag_configure("odd", background=ZEBRA, foreground=INK)
         self.tree.bind("<Double-1>", self._open_source_file)
         self.tree.bind("<Delete>", lambda e: self.delete_selected())
+        self.tree.bind("<Control-a>", lambda e: self.select_all_rows())
+        self.tree.bind("<Control-A>", lambda e: self.select_all_rows())
 
-        foot = ttk.Frame(box, style="Card.TFrame")
-        foot.pack(fill="x", pady=(px(9), 0))
         RoundedButton(foot, text="Download CSV", variant="success", theme=t,
                       min_width=px(150),
                       command=self.download_csv).pack(side="left")
@@ -547,12 +567,14 @@ class App:
                    command=self.clear_all).pack(side="right")
         RoundedButton(foot, text="Delete selected", variant="danger", theme=t,
                    command=self.delete_selected).pack(side="right", padx=(0, px(8)))
+        RoundedButton(foot, text="Select all", variant="secondary", theme=t,
+                   command=self.select_all_rows).pack(side="right", padx=(0, px(8)))
 
     # -------------------------------------------------------- statusbar --
     def _build_statusbar(self) -> None:
         t, px = self.t, self.t.px
         panel = card(self.root)
-        panel.pack(fill="x", padx=px(12), pady=(px(8), px(10)))
+        panel.pack(side="bottom", fill="x", padx=px(12), pady=(px(8), px(10)))
         bar = ttk.Frame(panel, style="Card.TFrame", padding=(px(14), px(9)))
         bar.pack(fill="x")
         self.progress = ttk.Progressbar(bar, mode="determinate", maximum=100)
@@ -667,11 +689,33 @@ class App:
                               f"on {len(scope_ids):,} file(s) from this selection.")
             self.pipeline.start(scope_ids=scope_ids)
             self.pipeline.join()
-            self._enqueue_log("Finished.")
+            self._enqueue_log(self._completion_message(scope_ids))
         except Exception as e:                        # noqa: BLE001
             self._enqueue_log(f"FATAL: {e}")
         finally:
             self.ui_queue.put(("finished", None))
+
+    def _completion_message(self, scope_ids: Optional[List[int]] = None) -> str:
+        """Report what actually happened at the end of a run.
+
+        A run used to end on a bare "Finished." no matter what, so a folder
+        of 10 PDFs that all failed to render looked like a successful run
+        that simply found fewer records - the failures had already scrolled
+        past in the status line.
+        """
+        c = (self.pipeline.q.counts_for(scope_ids) if scope_ids
+             else self.pipeline.counts())
+        bad = c.get("dead", 0) + c.get("failed", 0)
+        if not bad:
+            return (f"Finished. {c.get('done', 0):,} file(s) processed, "
+                    f"{c.get('rows', 0):,} row(s).")
+        first = ""
+        for r in self.pipeline.q.failures(1):
+            first = f"  First error: {r['error']}"
+            break
+        return (f"Finished, but {bad:,} of {c.get('total', 0):,} file(s) FAILED "
+                f"({c.get('rows', 0):,} row(s) extracted).{first}  "
+                "Fix the cause, then press 'Retry failed'.")
 
     def toggle_pause(self) -> None:
         paused = self.btn_pause.cget("text") == "Pause"
@@ -702,7 +746,7 @@ class App:
         try:
             self.pipeline.start(scope_ids=ids)
             self.pipeline.join()
-            self._enqueue_log("Retry finished.")
+            self._enqueue_log("Retry: " + self._completion_message(ids))
         except Exception as e:                        # noqa: BLE001
             self._enqueue_log(f"FATAL: {e}")
         finally:
@@ -792,9 +836,16 @@ class App:
         self.row_count = c.get("rows", 0)
         self.badge.configure(text=f"{self.row_count:,} record(s)")
         if c.get("total"):
+            # Say out loud that the table is showing OLD results and how to
+            # get rid of them. The rows are restored on purpose - the queue
+            # is resumable and survives a reboot - but arriving to a table
+            # full of earlier runs with no explanation reads as a bug.
             self.status.configure(
-                text=(f"Resumable queue found: {c['total']:,} files "
+                text=(f"Resumable queue found: {c['total']:,} file(s) "
                       f"({c['done']:,} done, {c['pending']:,} pending). "
+                      f"The table shows {self.row_count:,} record(s) from "
+                      "earlier runs — 'Select all' + 'Delete selected' to "
+                      "drop some, 'Clear all' to wipe the queue and CSVs. "
                       "Press Extract to continue."))
             self._reload_table()
 
@@ -845,6 +896,25 @@ class App:
             return
         name = self.tree.item(sel[0], "values")[1]
         self.status.configure(text=f"Row source: {name}")
+
+    def select_all_rows(self) -> str:
+        """Select every row currently in the table (button, or Ctrl+A).
+
+        "Delete selected" has always worked on multiple rows, but the only
+        way to select them was ctrl-clicking one at a time - impractical
+        past a handful, so clearing a table of scraped results looked like
+        it needed a feature that was in fact already there.
+        """
+        children = self.tree.get_children()
+        if not children:
+            self.status.configure(text="Nothing in the table to select.")
+            return "break"
+        self.tree.selection_set(children)
+        self.status.configure(
+            text=(f"Selected {len(children):,} row(s). "
+                  "'Delete selected' removes them from the CSV and the "
+                  "queue; 'Clear all' wipes everything including the queue."))
+        return "break"
 
     def delete_selected(self) -> None:
         """Delete the checked/highlighted row(s): from the table, the CSV

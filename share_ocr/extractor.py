@@ -19,11 +19,13 @@ import os
 import re
 import shutil
 import tempfile
+import threading
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional
 
-from .config import ADDON_FIELDS, FIELDS, PROMPT, Settings
+from .config import (ADDON_FIELDS, FIELDS, MODEL_KEYS, PAGE_CERTIFICATE,
+                     PAGE_KIND, PAGE_TRANSFER, PROMPT, Settings)
 from .secrets import get_api_key
 
 
@@ -46,17 +48,78 @@ def downscale_to_jpeg_b64(path: str, max_px: int, quality: int) -> str:
     return base64.b64encode(buf.getvalue()).decode("ascii")
 
 
-def pdf_to_images(pdf_path: str, dpi: int) -> List[str]:
+def _pdf_tmpdir() -> Path:
+    tmpdir = Path(tempfile.gettempdir()) / "share_ocr_pdf"
+    tmpdir.mkdir(parents=True, exist_ok=True)
+    return tmpdir
+
+
+def _page_name(pdf_path: str, index: int) -> Path:
+    # Thread id as well as pid: workers are threads, and two of them rendering
+    # different PDFs that share a stem would otherwise fight over one file.
+    return _pdf_tmpdir() / (
+        f"{Path(pdf_path).stem}_{os.getpid()}_{threading.get_ident()}_p{index}.jpg")
+
+
+def _pdf_via_pdfium(pdf_path: str, dpi: int) -> List[str]:
+    """Render with pypdfium2 - a self-contained wheel, no external binary.
+
+    This is the primary path precisely because the customer gets an .exe:
+    asking them to install poppler and put it on PATH is a support ticket
+    waiting to happen.
+    """
+    import pypdfium2 as pdfium
+
+    out: List[str] = []
+    doc = pdfium.PdfDocument(pdf_path)
+    try:
+        for i in range(len(doc)):
+            page = doc[i]
+            bitmap = page.render(scale=dpi / 72.0)   # pdfium works in points
+            image = bitmap.to_pil()
+            p = _page_name(pdf_path, i)
+            image.convert("RGB").save(p, "JPEG", quality=85)
+            out.append(str(p))
+    finally:
+        doc.close()
+    return out
+
+
+def _pdf_via_poppler(pdf_path: str, dpi: int) -> List[str]:
+    """Legacy path for machines that already have poppler set up."""
     from pdf2image import convert_from_path
 
     out: List[str] = []
-    tmpdir = Path(tempfile.gettempdir()) / "share_ocr_pdf"
-    tmpdir.mkdir(parents=True, exist_ok=True)
     for i, page in enumerate(convert_from_path(pdf_path, dpi=dpi)):
-        p = tmpdir / f"{Path(pdf_path).stem}_{os.getpid()}_p{i}.jpg"
+        p = _page_name(pdf_path, i)
         page.save(p, "JPEG", quality=85)
         out.append(str(p))
     return out
+
+
+def pdf_to_images(pdf_path: str, dpi: int) -> List[str]:
+    """Every page of a PDF as a temporary JPEG path.
+
+    Tries pypdfium2 first, then poppler/pdf2image. If neither backend is
+    usable the error says how to fix it, instead of surfacing pdf2image's
+    "Is poppler installed and in PATH?" three retries deep in a worker
+    thread - which is how a folder of 10 PDFs silently became 0 rows.
+    """
+    errors: List[str] = []
+    for label, fn in (("pypdfium2", _pdf_via_pdfium),
+                      ("poppler/pdf2image", _pdf_via_poppler)):
+        try:
+            return fn(pdf_path, dpi)
+        except ImportError as e:
+            errors.append(f"{label}: not installed ({e})")
+        except Exception as e:                          # noqa: BLE001
+            errors.append(f"{label}: {type(e).__name__}: {e}")
+    raise RuntimeError(
+        "Could not read the PDF %s.\n\n"
+        "PDF support needs one of these:\n"
+        "    pip install pypdfium2       (recommended - no extra downloads)\n"
+        "  or poppler installed and on PATH (used by pdf2image)\n\n"
+        "Backends tried:\n  %s" % (Path(pdf_path).name, "\n  ".join(errors)))
 
 
 def make_thumbnail(path: str, dest: Path, size: int = 160) -> Optional[str]:
@@ -84,22 +147,79 @@ class BaseEngine:
         raise NotImplementedError
 
     def extract_file(self, path: str) -> List[Dict]:
-        """Handle images and multi-page PDFs uniformly."""
-        records: List[Dict] = []
-        if path.lower().endswith(".pdf"):
-            for i, img in enumerate(pdf_to_images(path, self.s.pdf_dpi), start=1):
-                rec = self.extract_image(img)
-                rec["page_no"] = i
-                records.append(rec)
-                try:
-                    os.remove(img)
-                except OSError:
-                    pass
-        else:
+        """Handle images and multi-page PDFs uniformly.
+
+        A multi-page PDF is normally ONE certificate scanned front and back,
+        so the pages are merged into a single record (see merge_pages).
+        """
+        if not path.lower().endswith(".pdf"):
             rec = self.extract_image(path)
             rec["page_no"] = 1
+            return [rec]
+
+        records: List[Dict] = []
+        for i, img in enumerate(pdf_to_images(path, self.s.pdf_dpi), start=1):
+            rec = self.extract_image(img)
+            rec["page_no"] = i
             records.append(rec)
-        return records
+            try:
+                os.remove(img)
+            except OSError:
+                pass
+        return merge_pages(records)
+
+
+# ------------------------------------------------------- front/back merge --
+def is_transfer_memo(rec: Dict) -> bool:
+    """True if this page is the reverse side, not a certificate face."""
+    kind = rec.get(PAGE_KIND)
+    if kind:
+        return str(kind).strip().lower() == PAGE_TRANSFER
+    # Engines that do not classify (or a model that omitted the field): a page
+    # naming neither a company nor a certificate number is not a face.
+    return not rec.get("company_name") and not rec.get("certificate_no")
+
+
+def _fold_memo(face: Dict, memo: Dict) -> None:
+    """Move the two fields that exist ONLY on the reverse onto the face."""
+    latest = memo.get("latest_share_holder_name")
+    if latest:
+        face["latest_share_holder_name"] = latest
+    note = memo.get("remarks")
+    if note:
+        face["remarks"] = "; ".join(
+            x for x in (face.get("remarks"), note) if x)
+
+
+def merge_pages(pages: List[Dict]) -> List[Dict]:
+    """Fold a front/back certificate scan into one record per certificate.
+
+    Why this exists
+    ---------------
+    Every page used to become its own CSV row. On a real batch of 10
+    front-and-back PDFs that produced 20 rows, 10 of which were the model
+    trying to read a transfer table as a certificate - inventing company
+    names off the rubber stamps ("SHANTHILAL INTERWELL LIMITED"), share
+    counts and face values. Half the deliverable was fiction.
+
+    The reverse is also the ONLY place latest_share_holder_name and the
+    transfer remarks appear, so merging is what makes those two contractual
+    fields correct rather than merely absent: the face alone always claims
+    the original holder is still the current one.
+
+    A memo attaches to the face immediately before it, so a multi-certificate
+    scan (F,B,F,B) splits correctly instead of collapsing into one row.
+    """
+    out: List[Dict] = []
+    for rec in pages:
+        if not is_transfer_memo(rec):
+            out.append(rec)
+        elif out:
+            _fold_memo(out[-1], rec)
+    # A scan with no recognisable face at all (a stray reverse side on its
+    # own) still has to produce a row, or the file is marked done with no
+    # output and nobody ever finds out. Validation will flag it loudly.
+    return out or pages
 
 
 class OpenAIEngine(BaseEngine):
@@ -141,7 +261,7 @@ class OpenAIEngine(BaseEngine):
             }],
         )
         data = json.loads(resp.choices[0].message.content)
-        return {k: data.get(k) for k in FIELDS}
+        return {k: data.get(k) for k in MODEL_KEYS}
 
 
 class TesseractEngine(BaseEngine):
@@ -311,6 +431,13 @@ class TesseractEngine(BaseEngine):
         # If only one folio number is printed, it serves as both.
         if not rec.get("registered_folio_no") and rec.get("folio_no"):
             rec["registered_folio_no"] = rec["folio_no"]
+
+        # Front or back? The reverse carries this heading and nothing else
+        # useful, so classifying it keeps merge_pages() working offline too.
+        rec[PAGE_KIND] = (
+            PAGE_TRANSFER
+            if re.search(r"memorandum\s+of\s+transfers?", low)
+            else PAGE_CERTIFICATE)
 
         rec["_raw_text"] = text[:2000]
         return rec

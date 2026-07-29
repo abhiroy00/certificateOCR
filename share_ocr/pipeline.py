@@ -19,8 +19,10 @@ import logging
 import os
 import queue
 import random
+import re
 import threading
 import time
+from collections import defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Dict, Iterator, List, Optional, Tuple
@@ -31,6 +33,65 @@ from .csv_writer import ShardedCsvWriter, record_to_row
 from .extractor import build_engine, validate
 
 log = logging.getLogger("share_ocr")
+
+# "Please try again in 656ms" / "in 1.5s", as OpenAI words it.
+_RETRY_HINT = re.compile(r"try again in\s*([0-9.]+)\s*(ms|s)\b", re.I)
+_RATE_LIMIT_MARKERS = ("rate limit", "429", "rate_limit_exceeded")
+
+
+def is_rate_limit(exc: BaseException) -> bool:
+    return any(k in str(exc).lower() for k in _RATE_LIMIT_MARKERS)
+
+
+def retry_after_seconds(exc: BaseException) -> Optional[float]:
+    """How long the API asked us to wait, from the headers or the message."""
+    resp = getattr(exc, "response", None)
+    headers = getattr(resp, "headers", None) or {}
+    for key in ("retry-after-ms", "retry-after"):
+        try:
+            raw = headers.get(key)
+        except Exception:                               # noqa: BLE001
+            raw = None
+        if raw:
+            try:
+                v = float(raw)
+                return v / 1000.0 if key.endswith("-ms") else v
+            except (TypeError, ValueError):
+                pass
+    m = _RETRY_HINT.search(str(exc))
+    if m:
+        v = float(m.group(1))
+        return v / 1000.0 if m.group(2).lower() == "ms" else v
+    return None
+
+
+class RateGate:
+    """Process-wide brake shared by every worker.
+
+    A 429 from one worker used to tell the other seven nothing: they kept
+    firing into an exhausted quota, each burned an attempt, and files hit
+    max_attempts and died while the *account* was merely busy - 5 of 10 went
+    to 'dead' within seconds. Now the first worker to hit the wall parks the
+    whole pool until the window the API actually asked for has passed.
+    """
+
+    def __init__(self) -> None:
+        self._until = 0.0
+        self._lock = threading.Lock()
+
+    def wait(self, stop: threading.Event) -> None:
+        while not stop.is_set():
+            with self._lock:
+                remaining = self._until - time.time()
+            if remaining <= 0:
+                return
+            time.sleep(min(remaining, 0.25))
+
+    def penalise(self, seconds: float) -> float:
+        seconds = max(0.5, min(60.0, seconds))
+        with self._lock:
+            self._until = max(self._until, time.time() + seconds)
+            return self._until - time.time()
 
 
 # ------------------------------------------------------------------ scan --
@@ -114,6 +175,12 @@ class Pipeline:
         self._engines: Dict[int, object] = {}
         self._engine_lock = threading.Lock()
         self._scope_ids: Optional[List[int]] = None
+        self._rate = RateGate()
+        # Rate-limit requeues per file. A 429 does not count as an attempt,
+        # so this is the only thing stopping a file bouncing forever if the
+        # quota never recovers.
+        self._rl_hits: Dict[int, int] = defaultdict(int)
+        self._rl_lock = threading.Lock()
 
     # ---------------------------------------------------------- ingest --
     def ingest(self, roots: List[str], batch: Optional[str] = None) -> int:
@@ -186,13 +253,49 @@ class Pipeline:
         return any(t.is_alive() for t in self._threads)
 
     # --------------------------------------------------------- workers --
+    def _claim_size(self, q: db.Queue) -> int:
+        """How many rows this worker should take in one claim.
+
+        A flat claim_batch (200) meant the first worker to reach the queue
+        took the ENTIRE selection and the other N-1 exited idle a second
+        later. A 10-file run from the GUI - the common case, since a
+        selection is usually smaller than claim_batch x workers - therefore
+        ran single-file-at-a-time no matter how many workers were
+        configured.
+
+        So: claim in bulk while there is bulk to claim, and fall back to a
+        fair share when the queue is nearly drained. The count is capped
+        (see pending_count) so the 30-lakh path pays almost nothing for it
+        and still gets the full batch.
+        """
+        cap = max(1, self.s.claim_batch * max(1, self.s.workers))
+        try:
+            pending = q.pending_count(self._scope_ids, cap=cap)
+        except Exception:                               # noqa: BLE001
+            return self.s.claim_batch
+        if pending >= cap:
+            return self.s.claim_batch
+        fair = -(-pending // max(1, self.s.workers))    # ceil division
+        return max(1, min(self.s.claim_batch, fair))
+
+    @staticmethod
+    def _release(q: db.Queue, file_id: int) -> None:
+        """Hand a claimed-but-unprocessed file back to the queue."""
+        try:
+            q.conn.execute(
+                "UPDATE files SET status='pending' WHERE id=? AND status='running'",
+                (file_id,))
+            q.conn.commit()
+        except Exception:                               # noqa: BLE001
+            pass
+
     def _worker(self, idx: int) -> None:
         q = db.Queue(self.s.db_path)   # thread-local connection
         idle_rounds = 0
         while not self._stop.is_set():
             while self._pause.is_set() and not self._stop.is_set():
                 time.sleep(0.25)
-            rows = q.claim(self.s.claim_batch, worker=f"w{idx}",
+            rows = q.claim(self._claim_size(q), worker=f"w{idx}",
                           scope_ids=self._scope_ids)
             if not rows:
                 # DUPLICATE-ROW BUG (fixed): the old code probed for work with
@@ -209,17 +312,48 @@ class Pipeline:
             idle_rounds = 0
             for r in rows:
                 if self._stop.is_set():
-                    # give unfinished work back to the queue
-                    q.conn.execute(
-                        "UPDATE files SET status='pending' WHERE id=? AND status='running'",
-                        (r["id"],))
-                    q.conn.commit()
+                    self._release(q, r["id"])   # give the work back
                     continue
-                self._process_one(q, r["id"], r["path"], r["name"])
+                try:
+                    self._process_one(q, r["id"], r["path"], r["name"])
+                except BaseException:           # noqa: BLE001
+                    # _process_one handles its own failures. Anything that
+                    # escapes here means this thread is dying mid-file, and
+                    # the row must not be left 'running' - that state is
+                    # invisible to the next Extract and (before the db fix)
+                    # to Retry as well, so the file silently produced
+                    # nothing. Observed for real on a 429 backoff.
+                    self._release(q, r["id"])
+                    raise
         q.close()
+
+    MAX_RATE_LIMIT_REQUEUES = 20
+
+    def _handle_rate_limit(self, q: db.Queue, file_id: int, name: str,
+                           exc: BaseException) -> bool:
+        """Park the pool and give the file back uncounted. True if handled.
+
+        A 429 means the account is out of quota for this minute, not that
+        the scan is bad, so it must not push the file towards 'dead'.
+        """
+        with self._rl_lock:
+            self._rl_hits[file_id] += 1
+            hits = self._rl_hits[file_id]
+        if hits > self.MAX_RATE_LIMIT_REQUEUES:
+            return False        # quota never recovered - fail it for real
+        wait = retry_after_seconds(exc) or self.s.retry_base_delay
+        actual = self._rate.penalise(wait + random.random())
+        q.mark_rate_limited(file_id, f"{type(exc).__name__}: {exc}")
+        self.on_log(f"Rate limited — pausing all workers {actual:.1f}s "
+                   f"(retry {hits}/{self.MAX_RATE_LIMIT_REQUEUES}, {name})")
+        return True
 
     def _process_one(self, q: db.Queue, file_id: int, path: str, name: str) -> None:
         t0 = time.time()
+        self._rate.wait(self._stop)      # respect a penalty another worker took
+        if self._stop.is_set():
+            self._release(q, file_id)
+            return
         try:
             engine = self._engine()
             records = engine.extract_file(path)
@@ -229,18 +363,22 @@ class Pipeline:
             latency = int((time.time() - t0) * 1000)
             row_ids = q.mark_done(file_id, records, engine.name, self.s.model, latency)
         except Exception as e:                      # noqa: BLE001
+            if is_rate_limit(e) and self._handle_rate_limit(q, file_id, name, e):
+                return
             status = q.mark_failed(file_id, f"{type(e).__name__}: {e}",
                                    self.s.max_attempts)
             if status == db.DEAD:
                 self.stats.bump(failed=1)
             self.on_log(f"ERROR {name}: {type(e).__name__}: {e}")
-            # backoff on rate limits / transient network failures
+            # backoff on transient network failures
             msg = str(e).lower()
-            if any(k in msg for k in ("rate limit", "429", "timeout", "connection",
-                                      "overloaded", "503", "502")):
-                delay = self.s.retry_base_delay * (2 ** min(4, q.conn.execute(
-                    "SELECT attempts FROM files WHERE id=?", (file_id,)
-                ).fetchone()[0])) + random.random()
+            if any(k in msg for k in ("timeout", "connection", "overloaded",
+                                      "503", "502")):
+                row = q.conn.execute(
+                    "SELECT attempts FROM files WHERE id=?", (file_id,)).fetchone()
+                attempts = row[0] if row else 1
+                delay = self.s.retry_base_delay * (2 ** min(4, attempts)) \
+                    + random.random()
                 time.sleep(min(60.0, delay))
             return
 

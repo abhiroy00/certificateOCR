@@ -162,7 +162,17 @@ def main() -> int:
         app.selected_paths = [str(imgs)]
         opened = []
         app.open_api_key_dialog = lambda *a, **k: opened.append(1)
-        app.start_extract()
+        # Clearing the env var alone is not "no key configured": resolve()
+        # also reads the OS credential store and the fallback file, so on a
+        # developer machine with a real key in Windows Credential Manager the
+        # guard correctly did NOT fire and this test failed for the wrong
+        # reason. Stub the resolver so the test states what it means.
+        real_resolve = G.resolve
+        G.resolve = lambda *a, **k: (None, "none")
+        try:
+            app.start_extract()
+        finally:
+            G.resolve = real_resolve
         check("missing key opens the key dialog, not a dead-end warning",
               opened and not any(c[0] == "askyesno" for c in fake_tk.DIALOGS.calls))
         s.engine = install_stub()
@@ -225,6 +235,93 @@ def main() -> int:
         app._reload_table()
         check("switching back restores all rows",
               len(app.tree.get_children()) == 3)
+
+        # ------------------------------------------- bottom bar layout ---
+        # Regression: on a 1080p screen the results table consumed the whole
+        # cavity and Tk clipped everything packed after it, so the status bar
+        # and the Select all / Delete selected / Clear all row were simply
+        # not on screen. Both must be anchored to the bottom, and both must
+        # be packed BEFORE the widget that expands into the leftover space.
+        print("\n[3b] the bottom bars cannot be squeezed off screen")
+
+        def pack_order(parent):
+            return [c for c in parent.children if c.packed]
+
+        status_panel = app.status.master.master
+        check("status bar is anchored to the bottom",
+              status_panel.pack_kw.get("side") == "bottom",
+              status_panel.pack_kw)
+
+        foot = None
+        for w in walk(root):
+            kids = [c for c in getattr(w, "children", [])
+                    if isinstance(c, RoundedButton)]
+            if {"Clear all", "Delete selected", "Select all"} <= {
+                    c.cget("text") for c in kids}:
+                foot = w
+                break
+        check("the row-action buttons exist", foot is not None)
+        if foot is not None:
+            check("row-action bar is anchored to the bottom",
+                  foot.pack_kw.get("side") == "bottom", foot.pack_kw)
+            siblings = pack_order(foot.master)
+            expanders = [c for c in siblings if c.pack_kw.get("expand")]
+            check("it is packed before the expanding table",
+                  all(siblings.index(foot) < siblings.index(e)
+                      for e in expanders),
+                  "foot at %d, expanders at %s"
+                  % (siblings.index(foot),
+                     [siblings.index(e) for e in expanders]))
+
+        # ------------------------------ select all / delete selected ----
+        # This path shipped with no coverage at all: the old fake Treeview
+        # reported a single hard-coded selection and had no selection_set,
+        # so multi-row delete could not be exercised.
+        print("\n[8b] select all + delete selected")
+        check("every table iid is a real DB row_id",
+              all(str(i).isdigit() for i in app.tree.get_children()),
+              str(app.tree.get_children()))
+
+        app.select_all_rows()
+        check("select all selects every row",
+              len(app.tree.selection()) == len(app.tree.get_children()) == 3,
+              "%d selected" % len(app.tree.selection()))
+
+        fake_tk.DIALOGS.reset()
+        fake_tk.DIALOGS.askyesno_result = True
+        victims = list(app.tree.get_children())[:2]
+        app.tree.selection_set(victims)
+        app.delete_selected()
+        check("delete asks before destroying data",
+              any(c[0] == "askyesno" for c in fake_tk.DIALOGS.calls))
+        check("both selected rows leave the table",
+              len(app.tree.get_children()) == 1,
+              "%d left" % len(app.tree.get_children()))
+        check("both selected rows leave the database",
+              app.pipeline.counts()["rows"] == 1, app.pipeline.counts())
+        check("their source files go back to pending so Extract can redo them",
+              app.pipeline.counts().get("pending", 0) == 2,
+              app.pipeline.counts())
+
+        fake_tk.DIALOGS.reset()
+        app.tree.selection_set([])
+        app.delete_selected()
+        check("deleting nothing tells the user instead of failing silently",
+              any(c[0] == "showinfo" for c in fake_tk.DIALOGS.calls),
+              str(fake_tk.DIALOGS.calls))
+
+        # The two deleted files are pending again, so re-running restores
+        # them. That both resets the state for the checks below and proves
+        # the requeue is real: a deleted row must be re-extractable, not
+        # leave a 'done' file with no result stranded forever.
+        app.pipeline.start()
+        app.pipeline.join()
+        root.run_pending()
+        app._drain_ui_queue()
+        app._reload_table()
+        check("re-extracting the requeued files restores all three rows",
+              len(app.tree.get_children()) == 3,
+              "%d rows" % len(app.tree.get_children()))
 
         # ------------------------------------------------- clear all ----
         print("\n[9] clear all")

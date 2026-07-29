@@ -14,6 +14,8 @@ Notes
 * Tesseract is a separate native program. If the customer wants the offline
   engine, they still install Tesseract themselves; the app finds it
   automatically in the default folder.
+* PDF input needs nothing extra: pypdfium2 ships its renderer inside the exe.
+  Poppler is only used as a fallback if it happens to be installed.
 * The OpenAI key is NOT baked into the exe. The user pastes it into the app
   once and it goes to the Windows Credential Manager.
 """
@@ -42,6 +44,9 @@ def main() -> int:
         "--windowed",                 # no console window behind the GUI
         "--name", NAME,
         "--collect-all", "tkinterdnd2",
+        # Bundles the PDFium binary, so PDFs work on a customer PC that has
+        # never heard of poppler.
+        "--collect-all", "pypdfium2",
         "--hidden-import", "PIL._tkinter_finder",
     ]
     if ICON.exists():

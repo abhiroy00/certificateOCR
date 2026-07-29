@@ -49,6 +49,18 @@ ADDON_FIELDS: List[str] = [
     "registered_folio_no",
 ]
 
+# Indian share certificates are routinely scanned front AND back: the reverse
+# is a ruled "Memorandum of Transfers" table, not a second certificate. The
+# model reports which side it is looking at in this control field, and
+# BaseEngine.extract_file uses it to fold the pair into ONE record. It is
+# deliberately NOT in CSV_COLUMNS - it never reaches the deliverable.
+PAGE_KIND = "page_kind"
+PAGE_CERTIFICATE = "certificate"
+PAGE_TRANSFER = "transfer_memo"
+
+# What the model is asked to return: the CSV fields plus the control field.
+MODEL_KEYS: List[str] = FIELDS + [PAGE_KIND]
+
 CSV_COLUMNS: List[str] = [
     "row_id",
     "source_file",
@@ -137,7 +149,30 @@ These three are contractual add-ons - extract them carefully, do not skip them:
   off, return the part you can actually read - do not invent the missing
   words.
 - If any field is not readable, use null. DO NOT guess or hallucinate.
-""".format(keys=json.dumps(FIELDS, indent=2))
+  In particular, if the "Distinctive No(s)" box is BLANK, return null for
+  distinctive_from and distinctive_to. Do NOT fill in a range that merely
+  matches no_of_shares (1 to 50 for 50 shares) - an invented range is
+  self-consistent, so nothing downstream can catch it.
+- date_of_issue is the date the certificate was ISSUED - the one next to
+  "Given under the Common Seal of the Company this ...". Certificates also
+  carry other dates: allotment/call-payment stamps ("Amount paid up on
+  Allotment 13 JUN 1990"), transfer dates, and revenue-stamp cancellations.
+  Do not return those.
+
+- page_kind: "certificate" if this page is the FACE of the certificate (it
+  names the company and carries a certificate number, holder and share
+  count). Use "transfer_memo" if it is the REVERSE - a ruled table headed
+  "MEMORANDUM OF TRANSFERS OF SHARE(S) MENTIONED OVERLEAF".
+  On a transfer_memo page:
+    * every certificate field must be null. Do NOT invent a company name
+      from a rubber stamp or letterhead abbreviation, and do NOT copy
+      transfer numbers, IW numbers or register-folio numbers into folio_no,
+      registered_folio_no, certificate_no, no_of_shares or distinctive_*.
+    * latest_share_holder_name = the transferee on the LAST (most recent)
+      filled row of the table.
+    * remarks = the whole chain, oldest first, joined with "; ", each entry
+      as "Transferred DD-MM-YY to NAME" (omit the date if it is not legible).
+""".format(keys=json.dumps(MODEL_KEYS, indent=2))
 
 
 # The only engines that exist. There is deliberately no demo/mock engine:

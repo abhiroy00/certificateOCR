@@ -217,6 +217,36 @@ class Queue:
         out["rows"] = rows
         return out
 
+    def pending_count(self, scope_ids: Optional[Sequence[int]] = None,
+                      cap: int = 10_000) -> int:
+        """How many claimable rows are waiting, counting no further than `cap`.
+
+        The cap matters: a bare COUNT(*) over 3M rows on every claim round
+        would cost more than the work it is scheduling. Callers only need to
+        know "fewer than cap, and how many" versus "at least cap".
+        """
+        conn = self.conn
+        if scope_ids is not None:
+            if not scope_ids:
+                return 0
+            total = 0
+            buf = list(scope_ids)
+            for i in range(0, len(buf), 500):
+                part = buf[i:i + 500]
+                qs = ",".join("?" * len(part))
+                total += conn.execute(
+                    f"SELECT COUNT(*) FROM (SELECT 1 FROM files"
+                    f" WHERE status IN ('pending','failed')"
+                    f"   AND id IN ({qs}) LIMIT ?)",
+                    [*part, cap]).fetchone()[0]
+                if total >= cap:
+                    return cap
+            return total
+        return conn.execute(
+            "SELECT COUNT(*) FROM (SELECT 1 FROM files"
+            " WHERE status IN ('pending','failed') LIMIT ?)",
+            (cap,)).fetchone()[0]
+
     def requeue_stale(self, older_than_s: float = 900) -> int:
         cur = self.conn.cursor()
         cur.execute(
@@ -248,6 +278,21 @@ class Queue:
         )
         cur.execute("COMMIT")
         return row_ids
+
+    def mark_rate_limited(self, file_id: int, error: str) -> None:
+        """Return a file to the queue WITHOUT counting the try.
+
+        A 429 says the account is out of quota this minute; it says nothing
+        about the scan. Counting it toward max_attempts sent five perfectly
+        good certificates to 'dead' within seconds of each other while eight
+        workers stampeded an exhausted token budget.
+        """
+        self.conn.execute(
+            "UPDATE files SET status='pending', error=?, updated_at=?"
+            " WHERE id=?",
+            (error[:1000], time.time(), file_id),
+        )
+        self.conn.commit()
 
     def mark_failed(self, file_id: int, error: str, max_attempts: int) -> str:
         conn = self.conn
@@ -314,15 +359,39 @@ class Queue:
             (limit,),
         ).fetchall()
 
+    # A row claimed longer ago than this is not really in flight: the worker
+    # that took it is gone. Long enough to never race a slow OpenAI call
+    # (request_timeout defaults to 90s), short enough that "Retry failed"
+    # rescues the file in the same session instead of after requeue_stale().
+    STALE_RUNNING_S = 300
+
+    def _recoverable_sql(self) -> str:
+        """Files a retry should pick up.
+
+        'running' has to be in here. A worker that dies between claiming a
+        file and finishing it - the classic case being a 429 backoff, where
+        the row is re-claimed and then the run ends - leaves the row stuck
+        as 'running'. That is neither 'failed' nor 'dead', so the old query
+        could not see it: the file produced no rows and no amount of
+        pressing Retry would ever touch it. Only requeue_stale() rescued it,
+        15 minutes later, if the app happened to still be open.
+        """
+        return ("status IN ('failed','dead')"
+                " OR (status='running' AND COALESCE(claimed_at, 0) < ?)")
+
     def failed_or_dead_ids(self) -> List[int]:
+        cutoff = time.time() - self.STALE_RUNNING_S
         return [r[0] for r in self.conn.execute(
-            "SELECT id FROM files WHERE status IN ('failed','dead')").fetchall()]
+            f"SELECT id FROM files WHERE {self._recoverable_sql()}",
+            (cutoff,)).fetchall()]
 
     def retry_failed(self) -> int:
+        cutoff = time.time() - self.STALE_RUNNING_S
         cur = self.conn.cursor()
         cur.execute(
-            "UPDATE files SET status='pending', attempts=0, error=NULL"
-            " WHERE status IN ('failed','dead')"
+            f"UPDATE files SET status='pending', attempts=0, error=NULL"
+            f" WHERE {self._recoverable_sql()}",
+            (cutoff,),
         )
         return cur.rowcount
 
