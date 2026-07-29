@@ -57,10 +57,7 @@ def main() -> int:
     if not check_module("PIL", True, "pip install pillow"):
         hard_fail = True
     check_module("openai", False, "pip install openai — only needed for the openai engine")
-    pdfium = check_module("pypdfium2", False,
-                          "pip install pypdfium2 — the recommended PDF backend")
-    pdf2img = check_module("pdf2image", False,
-                           "pip install pdf2image — fallback PDF backend, needs poppler")
+    check_module("pdf2image", False, "pip install pdf2image — only needed for PDFs")
     check_module("pytesseract", False, "pip install pytesseract — only for the offline engine")
     check_module("tkinterdnd2", False, "pip install tkinterdnd2 — enables drag & drop "
                                        "(click-to-select still works without it)")
@@ -68,22 +65,10 @@ def main() -> int:
                                    "OS credential store instead of a local file")
 
     # --- external binaries ----------------------------------------------
-    poppler = shutil.which("pdftoppm")
-    line(OK if poppler else WARN, "pdftoppm",
-         poppler or "not found — poppler is only needed when pypdfium2 is absent")
-    tess = shutil.which("tesseract")
-    line(OK if tess else WARN, "tesseract",
-         tess or "not found — needed only for the offline engine")
-
-    # PDF input works if EITHER backend is usable. Say so plainly: this is
-    # the check that would have caught a folder of PDFs failing silently.
-    if pdfium:
-        line(OK, "PDF input", "pypdfium2 (no external binary needed)")
-    elif pdf2img and poppler:
-        line(OK, "PDF input", "pdf2image + poppler")
-    else:
-        line(WARN, "PDF input", "UNAVAILABLE — PDFs will fail. Fix with: "
-                                "pip install pypdfium2")
+    for exe, why in (("pdftoppm", "poppler, needed for PDF input"),
+                     ("tesseract", "needed only for the offline engine")):
+        path = shutil.which(exe)
+        line(OK if path else WARN, exe, path or f"not found — {why}")
 
     # --- API key ----------------------------------------------------------
     try:

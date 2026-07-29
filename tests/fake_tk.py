@@ -367,7 +367,6 @@ class Treeview(Widget):
         self.columns_cfg = {}
         self.tags = {}
         self._seq = 0
-        self._selection = []
 
     def heading(self, key, **kw):
         self.headings[key] = kw
@@ -393,11 +392,6 @@ class Treeview(Widget):
             self.rows.pop(iid, None)
             if iid in self.order:
                 self.order.remove(iid)
-            if iid in self._selection:
-                self._selection.remove(iid)
-
-    def exists(self, iid):
-        return iid in self.rows
 
     def get_children(self, item=""):
         return tuple(self.order)
@@ -408,31 +402,8 @@ class Treeview(Widget):
             return row.get("values", ())
         return row
 
-    # A real Treeview is selectmode="extended": the operator ctrl-clicks
-    # several rows and hits "Delete selected". The old fake always reported
-    # exactly one row and had no way to set a selection at all, so that
-    # multi-row path could not be tested and never was.
     def selection(self):
-        return tuple(i for i in self._selection if i in self.rows)
-
-    def selection_set(self, *items):
-        if len(items) == 1 and isinstance(items[0], (list, tuple)):
-            items = tuple(items[0])
-        self._selection = [i for i in items if i in self.rows]
-
-    def selection_add(self, *items):
-        if len(items) == 1 and isinstance(items[0], (list, tuple)):
-            items = tuple(items[0])
-        for i in items:
-            if i in self.rows and i not in self._selection:
-                self._selection.append(i)
-
-    def selection_remove(self, *items):
-        if len(items) == 1 and isinstance(items[0], (list, tuple)):
-            items = tuple(items[0])
-        for i in items:
-            if i in self._selection:
-                self._selection.remove(i)
+        return tuple(self.order[:1])
 
     def yview(self, *a):
         return None

@@ -7,11 +7,7 @@ keyring>=24.0.0
 pillow>=10.0.0
 python-dotenv>=1.0.0
 
-# PDF support. pypdfium2 is a self-contained wheel (no poppler download, no
-# PATH surgery) and is the backend the app tries first, so PDFs work out of
-# the box for anyone running the .exe. pdf2image is kept as a fallback for
-# machines that already have poppler installed.
-pypdfium2>=4.30.0
+# PDF support (also needs the poppler binary)
 pdf2image>=1.17.0
 
 # optional offline engine
