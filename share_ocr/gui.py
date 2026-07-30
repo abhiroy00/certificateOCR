@@ -19,15 +19,16 @@ from __future__ import annotations
 
 import os
 import queue
+import subprocess
 import sys
 import threading
 import tkinter as tk
-import webbrowser
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
-from .config import APP_NAME, APP_VERSION, SUPPORTED_EXT, Settings
+from .config import (APP_NAME, APP_VERSION, SUPPORTED_DOC, SUPPORTED_EXT,
+                     SUPPORTED_IMG, Settings)
 from .extractor import make_thumbnail
 from .pipeline import Pipeline, Stats, scan_paths
 from .secrets import (delete_api_key, describe, looks_like_openai_key, mask,
@@ -123,6 +124,7 @@ class App:
         )
         self.ui_queue: "queue.Queue[tuple]" = queue.Queue()
         self.selected_paths: List[str] = []
+        self._sel_token = 0          # discards stale background file counts
         self.row_count = 0
         self._thumb_imgs: List[tk.PhotoImage] = []
 
@@ -137,8 +139,14 @@ class App:
 
         self._build_toolbar()
         self._build_dropzone()
-        self._build_results()
+        # Status bar BEFORE the results card, anchored to the bottom edge.
+        # Tk's packer gives each widget its requested size in packing order
+        # and only shares out the surplus afterwards, so the results table -
+        # which asks for a lot and expands - consumed the whole cavity and
+        # left nothing for whatever was packed after it. That is how the
+        # status bar ended up off the bottom of the window on a 1080p screen.
         self._build_statusbar()
+        self._build_results()
         self._restore_counts()
 
         # Sizing last, so requested widget sizes are known.
@@ -471,8 +479,31 @@ class App:
         self.btn_stop.pack(side="left", padx=px(8))
         RoundedButton(btns, text="Retry failed", variant="secondary", theme=t,
                    command=self.retry_failed).pack(side="left")
+
+        # Row actions live HERE, in the fixed-height action card, rather than
+        # in a footer under the results table. Two reasons:
+        #   * the results card expands, and anything packed after the table
+        #     was the first thing Tk dropped when the window was shorter than
+        #     the content - these buttons were being pushed off-screen
+        #     entirely on a 1080p display;
+        #   * every other verb (Extract, Stop, Retry) is already on this row,
+        #     so this is where an operator looks for an action.
+        RoundedButton(btns, text="Clear all", variant="danger", theme=t,
+                   command=self.clear_all).pack(side="right")
+        RoundedButton(btns, text="Delete selected", variant="danger", theme=t,
+                   command=self.delete_selected).pack(side="right", padx=(0, px(8)))
+        RoundedButton(btns, text="Select all", variant="secondary", theme=t,
+                   command=self.select_all_rows).pack(side="right", padx=(0, px(8)))
+
         self.sel_label = ttk.Label(btns, text="Nothing selected", style="Muted.TLabel")
-        self.sel_label.pack(side="right", pady=(px(6), 0))
+        self.sel_label.pack(side="right", padx=(0, px(16)), pady=(px(6), 0))
+
+        # Open the scan behind the highlighted row, so the extracted values
+        # can be checked against the actual certificate without hunting for
+        # the file. Also wired to double-click on a row.
+        RoundedButton(btns, text="Open", variant="secondary", theme=t,
+                   command=self.open_selected_source).pack(
+            side="right", padx=(0, px(10)))
 
     # ---------------------------------------------------------- results --
     def _build_results(self) -> None:
@@ -516,8 +547,12 @@ class App:
         wrap = ttk.Frame(box, style="Card.TFrame")
         wrap.pack(fill="both", expand=True, pady=(px(8), 0))
         self._table_wrap = wrap
+        # A modest requested height: the table expands to fill the window
+        # anyway, and the default inflated winfo_reqheight() enough to push
+        # the computed minimum window size past the screen.
         self.tree = ttk.Treeview(wrap, columns=[c[0] for c in COLUMNS],
-                                 show="headings", selectmode="extended")
+                                 show="headings", selectmode="extended",
+                                 height=6)
         for key, label, width in COLUMNS:
             self.tree.heading(key, text=label)
             self.tree.column(key, width=width, anchor="w",
@@ -535,24 +570,17 @@ class App:
         self.tree.tag_configure("odd", background=ZEBRA, foreground=INK)
         self.tree.bind("<Double-1>", self._open_source_file)
         self.tree.bind("<Delete>", lambda e: self.delete_selected())
-
-        foot = ttk.Frame(box, style="Card.TFrame")
-        foot.pack(fill="x", pady=(px(9), 0))
-        RoundedButton(foot, text="Download CSV", variant="success", theme=t,
-                      min_width=px(150),
-                      command=self.download_csv).pack(side="left")
-        RoundedButton(foot, text="Open CSV folder", variant="secondary", theme=t,
-                      command=self._open_output).pack(side="left", padx=px(8))
-        RoundedButton(foot, text="Clear all", variant="danger", theme=t,
-                   command=self.clear_all).pack(side="right")
-        RoundedButton(foot, text="Delete selected", variant="danger", theme=t,
-                   command=self.delete_selected).pack(side="right", padx=(0, px(8)))
+        self.tree.bind("<Control-a>", lambda e: self.select_all_rows())
+        self.tree.bind("<Control-A>", lambda e: self.select_all_rows())
+        # No footer under the table: the row actions moved up to the action
+        # row, and the CSV buttons are gone (shards are written continuously,
+        # and the toolbar's "Output folder" already opens the same place).
 
     # -------------------------------------------------------- statusbar --
     def _build_statusbar(self) -> None:
         t, px = self.t, self.t.px
         panel = card(self.root)
-        panel.pack(fill="x", padx=px(12), pady=(px(8), px(10)))
+        panel.pack(side="bottom", fill="x", padx=px(12), pady=(px(8), px(10)))
         bar = ttk.Frame(panel, style="Card.TFrame", padding=(px(14), px(9)))
         bar.pack(fill="x")
         self.progress = ttk.Progressbar(bar, mode="determinate", maximum=100)
@@ -586,16 +614,97 @@ class App:
         self.selected_paths = [p for p in paths if os.path.exists(p)]
         self._update_selection()
 
+    # Stop counting a monstrous tree once the number stops being useful to
+    # read; the exact total comes from the queue after Extract anyway.
+    SELECTION_COUNT_CAP = 200_000
+
+    @staticmethod
+    def count_selection(paths: List[str], cap: int = SELECTION_COUNT_CAP):
+        """(images, pdfs, capped) for a selection of files and/or folders.
+
+        Only counts extensions the pipeline will actually accept, so the
+        number shown matches the number that gets queued.
+        """
+        images = pdfs = 0
+        for p in paths:
+            if os.path.isdir(p):
+                for fp, _, _ in scan_paths(p):
+                    if fp.lower().endswith(SUPPORTED_DOC):
+                        pdfs += 1
+                    else:
+                        images += 1
+                    if images + pdfs >= cap:
+                        return images, pdfs, True
+            elif os.path.isfile(p):
+                low = p.lower()
+                if low.endswith(SUPPORTED_DOC):
+                    pdfs += 1
+                elif low.endswith(SUPPORTED_IMG):
+                    images += 1
+        return images, pdfs, False
+
+    @staticmethod
+    def describe_selection(images: int, pdfs: int, capped: bool = False) -> str:
+        """'10 files found  ·  3 images, 7 PDFs' - plural-correct."""
+        total = images + pdfs
+        if not total:
+            return "No supported files found in the selection"
+        parts = []
+        if images:
+            parts.append(f"{images:,} image" + ("s" if images != 1 else ""))
+        if pdfs:
+            parts.append(f"{pdfs:,} PDF" + ("s" if pdfs != 1 else ""))
+        prefix = f"{total:,}+" if capped else f"{total:,}"
+        return (f"{prefix} file" + ("s" if total != 1 else "") +
+                " found  ·  " + ", ".join(parts))
+
     def _update_selection(self) -> None:
         if not self.selected_paths:
             self.sel_label.configure(text="Nothing selected")
             return
-        first = self.selected_paths[0]
-        extra = f" (+{len(self.selected_paths) - 1} more)" if len(self.selected_paths) > 1 else ""
-        self.sel_label.configure(text=f"Selected: {os.path.basename(first) or first}{extra}")
-        self._show_thumbs(self.selected_paths)
+        # Counting walks the whole tree, which for the 30-lakh job is
+        # millions of entries - never on the UI thread. Show the folder
+        # immediately, then fill in the breakdown when the walk finishes.
+        first = os.path.basename(self.selected_paths[0]) or self.selected_paths[0]
+        self.sel_label.configure(text=f"Counting {first}…")
+        self._sel_token += 1
+        token = self._sel_token
+        paths = list(self.selected_paths)
+        threading.Thread(target=self._count_selection_bg, args=(paths, token),
+                         daemon=True, name="sel-count").start()
+        self._show_thumbs(self.selected_paths, token=token)
 
-    def _show_thumbs(self, paths: List[str]) -> None:
+    def _count_selection_bg(self, paths: List[str], token: int) -> None:
+        try:
+            images, pdfs, capped = self.count_selection(paths)
+        except Exception:                             # noqa: BLE001
+            return
+        self.ui_queue.put(("selection", (token, images, pdfs, capped)))
+
+    @staticmethod
+    def _selection_files(paths: List[str], limit: int) -> Tuple[List[str], bool]:
+        """First `limit` files in the selection, plus 'there were more'."""
+        files: List[str] = []
+        for p in paths:
+            if os.path.isdir(p):
+                for fp, _, _ in scan_paths(p):
+                    if len(files) >= limit:
+                        return files, True
+                    files.append(fp)
+            elif os.path.isfile(p):
+                if len(files) >= limit:
+                    return files, True
+                files.append(p)
+        return files, False
+
+    def _show_thumbs(self, paths: List[str],
+                     token: Optional[int] = None) -> None:
+        # One token per selection change, shared with the file count. Bumping
+        # it again here would make the count's own result look stale and get
+        # thrown away.
+        if token is None:
+            self._sel_token += 1
+            token = self._sel_token
         for w in self.thumb_bar.winfo_children():
             w.destroy()
         self._thumb_imgs.clear()
@@ -605,37 +714,73 @@ class App:
         # Show the strip only when there is something in it.
         self.thumb_bar.pack(fill="x", pady=(self.t.px(8), 0),
                             before=self._table_wrap)
-        files: List[str] = []
-        for p in paths:
-            if os.path.isdir(p):
-                for fp, _, _ in scan_paths(p):
-                    files.append(fp)
-                    if len(files) >= MAX_THUMBS:
-                        break
-            else:
-                files.append(p)
-            if len(files) >= MAX_THUMBS:
-                break
-        for i, f in enumerate(files[:MAX_THUMBS], start=1):
-            if f.lower().endswith(".pdf"):
-                continue
-            dest = self.s.thumb_dir / f"t{i}.jpg"
-            # Render the thumbnail at the physical pixel size so it is not
-            # upscaled (another source of the "blurry" look on hi-dpi).
-            tp = make_thumbnail(f, dest, self.t.px(76))
-            holder = tk.Frame(self.thumb_bar, bg=CARD)
+        tk.Label(self.thumb_bar, text="Rendering previews…", bg=CARD, fg=MUTED,
+                 font=self.t.f(-2)).pack(side="left", padx=4)
+        # Previews are built off the UI thread: a PDF page has to be rasterised
+        # to preview it, and a dozen of those on the UI thread freezes the
+        # window. The worker only writes JPEGs; Tk images are created back on
+        # the main thread, which is the only place that is safe.
+        threading.Thread(target=self._build_thumbs_bg,
+                         args=(list(paths), token),
+                         daemon=True, name="thumbs").start()
+
+    def _build_thumbs_bg(self, paths: List[str], token: int) -> None:
+        files, more = self._selection_files(paths, MAX_THUMBS)
+        size = self.t.px(76)
+        items = []
+        for i, f in enumerate(files, start=1):
+            if token != self._sel_token:
+                return                      # selection changed under us
+            dest = self.s.thumb_dir / f"t{token}_{i}.jpg"
+            items.append((i, f, make_thumbnail(f, dest, size)))
+        self.ui_queue.put(("thumbs", (token, items, more)))
+
+    def _render_thumbs(self, items, more: bool) -> None:
+        for w in self.thumb_bar.winfo_children():
+            w.destroy()
+        self._thumb_imgs.clear()
+        for i, src, thumb in items:
+            holder = tk.Frame(self.thumb_bar, bg=CARD, cursor="hand2")
             holder.pack(side="left", padx=4)
-            if tp:
+            if thumb:
                 try:
                     from PIL import Image, ImageTk
-                    img = ImageTk.PhotoImage(Image.open(tp))
+                    img = ImageTk.PhotoImage(Image.open(thumb))
                     self._thumb_imgs.append(img)
-                    tk.Label(holder, image=img, bg=CARD).pack()
+                    body = tk.Label(holder, image=img, bg=CARD, cursor="hand2")
                 except Exception:                    # noqa: BLE001
-                    tk.Label(holder, text="IMG", bg=BLUE_TINT, fg=MUTED,
-                             font=self.t.f(-2), width=10, height=4).pack()
-            tk.Label(holder, text=f"#{i}", bg=BLUE, fg="white",
-                     font=self.t.f(-3, "bold"), pady=self.t.px(2)).pack(fill="x")
+                    body = tk.Label(holder, text="?", bg=BLUE_TINT, fg=MUTED,
+                                    font=self.t.f(-2), width=10, height=4)
+            else:
+                # A preview can fail (corrupt scan, encrypted PDF) without the
+                # file itself being unreadable, so still offer it for opening.
+                body = tk.Label(holder, text=Path(src).suffix.upper().lstrip(".")
+                                or "FILE", bg=BLUE_TINT, fg=MUTED,
+                                font=self.t.f(-2), width=10, height=4,
+                                cursor="hand2")
+            body.pack()
+            cap = tk.Label(holder, text=f"#{i}", bg=BLUE, fg="white",
+                           font=self.t.f(-3, "bold"), pady=self.t.px(2),
+                           cursor="hand2")
+            cap.pack(fill="x")
+            # Click a preview to open the actual scan - the fastest way to
+            # check a row against the certificate it came from.
+            for w in (holder, body, cap):
+                w.bind("<Button-1>", lambda e, p=src: self._open_preview(p))
+        if more:
+            tk.Label(self.thumb_bar,
+                     text=f"…  first {MAX_THUMBS} of the selection",
+                     bg=CARD, fg=MUTED, font=self.t.f(-2)).pack(
+                side="left", padx=8)
+
+    def _open_preview(self, path: str) -> None:
+        if not os.path.exists(path):
+            self.status.configure(text=f"Missing on disk: {path}")
+            return
+        if self._open_path(path):
+            self.status.configure(text=f"Opened {os.path.basename(path)}")
+        else:
+            self.status.configure(text=f"Could not open {path}")
 
     # ----------------------------------------------------------- run ----
     def start_extract(self) -> None:
@@ -734,6 +879,17 @@ class App:
                 self._update_progress(payload)
             elif kind == "log":
                 self.status.configure(text=str(payload))
+            elif kind == "selection":
+                token, images, pdfs, capped = payload
+                # Ignore a count that finished after the operator already
+                # picked something else.
+                if token == self._sel_token:
+                    self.sel_label.configure(
+                        text=self.describe_selection(images, pdfs, capped))
+            elif kind == "thumbs":
+                token, items, more = payload
+                if token == self._sel_token:
+                    self._render_thumbs(items, more)
             elif kind == "finished":
                 self.btn_extract.configure(state="normal")
                 self.btn_stop.configure(state="disabled")
@@ -827,24 +983,108 @@ class App:
         except Exception as e:                        # noqa: BLE001
             messagebox.showerror(APP_NAME, str(e))
 
-    def _open_output(self) -> None:
-        path = str(self.s.csv_dir)
+    @staticmethod
+    def _open_path(path: str) -> bool:
+        """Hand a file or folder to the OS default application."""
         try:
             if os.name == "nt":
                 os.startfile(path)                    # type: ignore[attr-defined]
-            elif os.uname().sysname == "Darwin":
-                os.system(f'open "{path}"')
+            elif sys.platform == "darwin":
+                subprocess.Popen(["open", path])
             else:
-                webbrowser.open(f"file://{path}")
+                subprocess.Popen(["xdg-open", path])
+            return True
         except Exception:                             # noqa: BLE001
+            return False
+
+    def _open_output(self) -> None:
+        path = str(self.s.csv_dir)
+        if not self._open_path(path):
             messagebox.showinfo(APP_NAME, path)
 
-    def _open_source_file(self, _event) -> None:
+    # How many scans one click may open. Enough to compare a few rows,
+    # few enough that "Select all" then "Open" cannot carpet the desktop
+    # with 400 image viewers.
+    MAX_OPEN_AT_ONCE = 5
+
+    def open_selected_source(self) -> None:
+        """Open the original image/PDF for the highlighted row(s)."""
         sel = self.tree.selection()
         if not sel:
+            messagebox.showinfo(
+                APP_NAME, "Select a row in the table first, then press Open "
+                          "to view the certificate it was read from.")
             return
-        name = self.tree.item(sel[0], "values")[1]
-        self.status.configure(text=f"Row source: {name}")
+
+        wanted = list(sel)[:self.MAX_OPEN_AT_ONCE]
+        opened, missing, unknown = [], [], 0
+        for iid in wanted:
+            path = self._row_source_path(iid)
+            if not path:
+                unknown += 1
+            elif not os.path.exists(path):
+                missing.append(path)
+            elif self._open_path(path):
+                opened.append(os.path.basename(path))
+            else:
+                missing.append(path)
+
+        if missing:
+            messagebox.showwarning(
+                APP_NAME,
+                "Could not open:\n\n" + "\n".join(missing[:5]) +
+                "\n\nThe scan may have been moved, renamed or deleted since "
+                "it was extracted.")
+        if unknown and not opened:
+            messagebox.showinfo(
+                APP_NAME, "That row has no source file recorded, so there is "
+                          "nothing to open.")
+        if opened:
+            extra = ""
+            if len(sel) > len(wanted):
+                extra = (f"  ({len(sel):,} rows selected; opened the first "
+                         f"{len(wanted)})")
+            self.status.configure(
+                text="Opened " + ", ".join(opened) + extra)
+
+    def _row_source_path(self, iid) -> Optional[str]:
+        """Absolute path of the scan behind a table row.
+
+        The row iid IS the database row_id, which is the only reliable link:
+        the visible "File" column holds just the base name, and several
+        folders in a 30-lakh run will contain the same name.
+        """
+        try:
+            row_id = int(iid)
+        except (TypeError, ValueError):
+            return None
+        try:
+            return self.pipeline.q.source_path(row_id)
+        except Exception:                             # noqa: BLE001
+            return None
+
+    def _open_source_file(self, _event=None) -> None:
+        """Double-click a row. Used to only print the file name."""
+        self.open_selected_source()
+
+    def select_all_rows(self) -> str:
+        """Select every row in the table (button, or Ctrl+A).
+
+        "Delete selected" has always accepted multiple rows, but the only way
+        to select them was ctrl-clicking one at a time, which is unusable
+        past a handful - so clearing a table of scraped results looked like
+        it needed a feature that was already there.
+        """
+        children = self.tree.get_children()
+        if not children:
+            self.status.configure(text="Nothing in the table to select.")
+            return "break"
+        self.tree.selection_set(children)
+        self.status.configure(
+            text=(f"Selected {len(children):,} row(s). 'Delete selected' "
+                  "removes them from the CSV and the queue; 'Clear all' "
+                  "wipes everything including the queue."))
+        return "break"
 
     def delete_selected(self) -> None:
         """Delete the checked/highlighted row(s): from the table, the CSV

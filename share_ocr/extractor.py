@@ -19,6 +19,7 @@ import os
 import re
 import shutil
 import tempfile
+import threading
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional
@@ -46,8 +47,19 @@ def downscale_to_jpeg_b64(path: str, max_px: int, quality: int) -> str:
     return base64.b64encode(buf.getvalue()).decode("ascii")
 
 
-def pdf_to_images(pdf_path: str, dpi: int) -> List[str]:
-    """Render each PDF page to a JPEG on disk, one per page.
+def _page_jpeg_path(pdf_path: str, index: int) -> Path:
+    tmpdir = Path(tempfile.gettempdir()) / "share_ocr_pdf"
+    tmpdir.mkdir(parents=True, exist_ok=True)
+    # Thread id as well as pid: workers are threads, so two of them rendering
+    # different PDFs that happen to share a stem would otherwise write to the
+    # same filename and read each other's pages.
+    return tmpdir / (f"{Path(pdf_path).stem}_{os.getpid()}"
+                     f"_{threading.get_ident()}_p{index}.jpg")
+
+
+def pdf_to_images(pdf_path: str, dpi: int,
+                  max_pages: Optional[int] = None) -> List[str]:
+    """Render PDF pages to JPEGs on disk, one per page.
 
     Two renderers are supported:
       * pdf2image + poppler - what the README tells people to install, used
@@ -55,15 +67,19 @@ def pdf_to_images(pdf_path: str, dpi: int) -> List[str]:
       * PyMuPDF (pip install pymupdf) - a pure pip wheel with no external
         binary to install, so PDFs still work out of the box on a fresh
         Windows machine where nobody has set up poppler yet.
-    """
-    tmpdir = Path(tempfile.gettempdir()) / "share_ocr_pdf"
-    tmpdir.mkdir(parents=True, exist_ok=True)
 
+    `max_pages` stops after that many pages, which is what makes a cheap
+    first-page preview possible without rendering a whole document.
+    """
     if shutil.which("pdftoppm") or shutil.which("pdftocairo"):
         from pdf2image import convert_from_path
+        kwargs = {"dpi": dpi}
+        if max_pages:
+            kwargs["first_page"] = 1
+            kwargs["last_page"] = max_pages
         out: List[str] = []
-        for i, page in enumerate(convert_from_path(pdf_path, dpi=dpi)):
-            p = tmpdir / f"{Path(pdf_path).stem}_{os.getpid()}_p{i}.jpg"
+        for i, page in enumerate(convert_from_path(pdf_path, **kwargs)):
+            p = _page_jpeg_path(pdf_path, i)
             page.save(p, "JPEG", quality=85)
             out.append(str(p))
         return out
@@ -83,8 +99,10 @@ def pdf_to_images(pdf_path: str, dpi: int) -> List[str]:
     doc = fitz.open(pdf_path)
     try:
         for i, page in enumerate(doc):
+            if max_pages and i >= max_pages:
+                break
             pix = page.get_pixmap(matrix=matrix)
-            p = tmpdir / f"{Path(pdf_path).stem}_{os.getpid()}_p{i}.jpg"
+            p = _page_jpeg_path(pdf_path, i)
             pix.save(str(p))
             out.append(str(p))
     finally:
@@ -92,18 +110,43 @@ def pdf_to_images(pdf_path: str, dpi: int) -> List[str]:
     return out
 
 
+# Enough to read a certificate layout at thumbnail size, cheap enough that a
+# strip of a dozen previews renders in well under a second.
+THUMB_PDF_DPI = 60
+
+
 def make_thumbnail(path: str, dest: Path, size: int = 160) -> Optional[str]:
+    """A small JPEG preview of a scan. Handles PDFs as well as images.
+
+    PDFs used to be skipped outright, so a folder of PDF certificates showed
+    an empty preview strip - exactly the files an operator most wants to
+    eyeball before extracting.
+    """
+    scratch = None
     try:
         from PIL import Image, ImageOps
 
+        src = path
+        if path.lower().endswith(".pdf"):
+            pages = pdf_to_images(path, THUMB_PDF_DPI, max_pages=1)
+            if not pages:
+                return None
+            src = scratch = pages[0]
+
         dest.parent.mkdir(parents=True, exist_ok=True)
-        with Image.open(path) as im:
+        with Image.open(src) as im:
             im = ImageOps.exif_transpose(im).convert("RGB")
             im.thumbnail((size, size))
             im.save(dest, "JPEG", quality=75)
         return str(dest)
     except Exception:
         return None
+    finally:
+        if scratch:
+            try:
+                os.remove(scratch)
+            except OSError:
+                pass
 
 
 # ---------------------------------------------------------------- engines --

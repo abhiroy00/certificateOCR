@@ -1,0 +1,96 @@
+# ---------------------------------------------------------------- Python --
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+.conda/
+
+# Packaging / build output
+build/
+dist/
+sdist/
+wheels/
+*.egg-info/
+*.egg
+.eggs/
+MANIFEST
+
+# PyInstaller (build_exe.py writes these)
+*.spec
+*.manifest
+
+# Tooling caches
+.pytest_cache/
+.mypy_cache/
+.dmypy.json
+.ruff_cache/
+.tox/
+.nox/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+.hypothesis/
+
+# ------------------------------------------------------------- SECRETS ----
+# .env.example IS tracked on purpose - it is the template, with no real key.
+.env
+.env.*
+!.env.example
+
+# Written by secrets.py when no OS credential store is available. Holds the
+# OpenAI key (obfuscated, machine-bound). Must never reach a remote.
+credentials.json
+
+# ------------------------------------------------- app runtime artefacts --
+# These normally live in ~/.share_ocr, but land in the repo whenever
+# SHARE_OCR_HOME is pointed here (or --workdir is set to the project).
+.share_ocr/
+settings.json
+queue.db
+queue.db-wal
+queue.db-shm
+*.log
+
+# Sharded CSV output + the needs-review sidecar. Named precisely rather than
+# ignoring *.csv, so a genuine fixture CSV can still be committed.
+certificates-part-*.csv
+certificates-needs-review.csv
+certificates.csv
+
+# Preview thumbnails cache
+thumbs/
+
+# NOTE: ocr-doc/ is deliberately NOT ignored - those sample certificates are
+# the fixtures tests/golden/ground_truth.json is scored against.
+
+# ------------------------------------------------------- editors / OS -----
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.claude/settings.local.json
+
+# Windows
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+desktop.ini
+$RECYCLE.BIN/
+
+# macOS
+.DS_Store
+.AppleDouble
+._*
+
+# Linux
+.fuse_hidden*
+.nfs*

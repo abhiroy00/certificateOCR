@@ -297,6 +297,18 @@ class Queue:
         )
         cur.execute("COMMIT")
 
+    def source_path(self, row_id: int) -> Optional[str]:
+        """Absolute path of the scan a result row was extracted from.
+
+        The table only carries the file NAME, so this is what lets the GUI
+        reopen the original image/PDF for a row to eyeball the extraction
+        against.
+        """
+        r = self.conn.execute(
+            "SELECT f.path FROM results r JOIN files f ON f.id = r.file_id"
+            " WHERE r.row_id = ?", (row_id,)).fetchone()
+        return r[0] if r else None
+
     def recent_rows(self, limit: int = 200) -> List[sqlite3.Row]:
         self.conn.row_factory = sqlite3.Row
         return self.conn.execute(
