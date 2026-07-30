@@ -139,6 +139,39 @@ These three are contractual add-ons - extract them carefully, do not skip them:
 - If any field is not readable, use null. DO NOT guess or hallucinate.
 """.format(keys=json.dumps(FIELDS, indent=2))
 
+# Used instead of PROMPT when a scanned PDF has more than one page. Indian
+# share certificates routinely print a "MEMORANDUM OF TRANSFERS" ledger on
+# the physical reverse of the SAME certificate, which a PDF scan captures as
+# page 2. Sending that page to the model on its own (with no page-1 context)
+# made it force-fit the transfer ledger into the certificate schema and
+# invent a bogus second "certificate" - wrong folio, wrong certificate
+# number, company name misread off a watermark. Sending every page together
+# and telling the model what page 2 actually is fixes that at the source.
+MULTI_PAGE_NOTE = """
+
+You were given MULTIPLE page images of the SAME physical share certificate,
+in order (page 1 = the front; later pages = the reverse side of that same
+sheet, or a continuation). Return ONE JSON record for the whole certificate
+- never one record per page.
+
+- folio_no, registered_folio_no, certificate_no, share_holder_name,
+  no_of_shares, no_of_shares_words, distinctive_from, distinctive_to,
+  date_of_issue, face_value_per_share and share_type all come from the
+  FRONT page only.
+- A later page titled "MEMORANDUM OF TRANSFERS", "TRANSFER OF SHARES" or
+  similar is NOT a separate certificate and NOT a second row. It is a log
+  of later ownership changes for this same certificate. Use it only to:
+    * set latest_share_holder_name to the most recent transferee named in
+      that log (if none is listed, latest_share_holder_name = share_holder_name)
+    * append a short note to remarks, e.g. "Transferred to R MEENAKSHI on
+      30/08/96"
+  Never copy a transfer-log row's own folio/certificate number into
+  folio_no or certificate_no - those numbers belong to the transfer entry,
+  not the certificate.
+- If a later page is blank or unrelated, ignore it.
+"""
+PROMPT_MULTI_PAGE = PROMPT + MULTI_PAGE_NOTE
+
 
 # The only engines that exist. There is deliberately no demo/mock engine:
 # fake data must never be able to reach a customer CSV.
