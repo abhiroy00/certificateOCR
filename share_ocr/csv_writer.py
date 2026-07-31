@@ -82,6 +82,8 @@ class ShardedCsvWriter:
     @staticmethod
     def _append(path: Path, rows: List[Dict]) -> None:
         new = not path.exists()
+        if not new:
+            ShardedCsvWriter._repair_header_if_stale(path)
         with path.open("a", encoding="utf-8-sig", newline="") as f:
             w = csv.DictWriter(f, fieldnames=CSV_COLUMNS, extrasaction="ignore")
             if new:
@@ -89,6 +91,29 @@ class ShardedCsvWriter:
             for r in rows:
                 w.writerow(r)
             f.flush()
+
+    @staticmethod
+    def _repair_header_if_stale(path: Path) -> None:
+        """A shard written before a new field existed still has the old,
+        shorter header. New fields are always appended at the end of
+        CSV_COLUMNS (never inserted in the middle - that would silently
+        misalign every column after the insertion point for rows already
+        on disk), so fixing this is just rewriting the header line: old
+        rows simply have nothing in the new trailing column(s), which is
+        the correct, honest answer for data that was never extracted."""
+        with path.open("r", encoding="utf-8-sig", newline="") as f:
+            header_line = f.readline()
+        current = next(csv.reader([header_line]), [])
+        if current == CSV_COLUMNS or not current:
+            return
+        if CSV_COLUMNS[:len(current)] != current:
+            return   # not a clean prefix match - do not guess, leave as-is
+        with path.open("r", encoding="utf-8-sig", newline="") as f:
+            f.readline()
+            rest = f.read()
+        with path.open("w", encoding="utf-8-sig", newline="") as f:
+            csv.writer(f).writerow(CSV_COLUMNS)
+            f.write(rest)
 
     def close(self) -> None:
         self.flush()

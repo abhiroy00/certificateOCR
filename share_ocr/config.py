@@ -35,6 +35,9 @@ FIELDS: List[str] = [
     "distinctive_to",
     "date_of_issue",
     "latest_share_holder_name",
+    "latest_folio_no",
+    "folio_no_history",
+    "share_holder_history",
     "face_value_per_share",  # add-on #10 in the quotation
     "share_type",            # add-on #11 in the quotation
     "remarks",               # add-on #11 in the quotation
@@ -73,6 +76,11 @@ CSV_COLUMNS: List[str] = [
     "model",
     "latency_ms",
     "extracted_at",
+    "latest_folio_no",     # appended at the end, not inserted mid-list, so
+                           # existing CSV shards from before this field
+                           # existed don't get every later column shifted
+    "folio_no_history",    # same reason - always append, never insert
+    "share_holder_history",
 ]
 
 PROMPT = """You are extracting data from a scanned SHARE CERTIFICATE image.
@@ -92,6 +100,27 @@ Rules:
   the postal address that often sits directly below the names.
 - latest_share_holder_name = the transferee/endorsed holder if the certificate
   shows a transfer/endorsement, else the registered holder.
+- latest_folio_no = when a transfer/endorsement moved the shares to a new
+  "Register Folio" / "Regd. Folio" number (printed next to the transferee
+  in the endorsement, transfer stamp, or Memorandum of Transfers), return
+  that new folio number here. Else latest_folio_no = folio_no.
+- folio_no_history = every distinct folio number this certificate has ever
+  been registered under, oldest first, as a single string separated by
+  " -> " (e.g. "000003 -> 0015145 -> 00017369"). Start with folio_no (the
+  original), then add one more entry per transfer/endorsement that shows a
+  new folio number, in date order. If there are no transfers, or none of
+  them print a folio number, folio_no_history = folio_no (just the one
+  value, no arrows).
+- share_holder_history = every holder this certificate has ever been
+  registered to, oldest first, as a single string separated by " -> "
+  (e.g. "ABHAY AJMERA / AJAY AJMERA -> SHRI KIRTILAL M SHAH -> SHRI PRAKASH
+  CHASKAR -> BHUPENDRA DANGARWALA / RUPA DANGARWALA"). Start with
+  share_holder_name (the original registered holder(s)), then add one more
+  entry per transfer/endorsement naming a transferee, in the SAME date
+  order as folio_no_history - entry N here corresponds to entry N there.
+  If there are no transfers, share_holder_history = share_holder_name (just
+  the one value, no arrows). latest_share_holder_name is always the LAST
+  value in share_holder_history.
 
 These three are contractual add-ons - extract them carefully, do not skip them:
 
@@ -160,14 +189,42 @@ sheet, or a continuation). Return ONE JSON record for the whole certificate
   FRONT page only.
 - A later page titled "MEMORANDUM OF TRANSFERS", "TRANSFER OF SHARES" or
   similar is NOT a separate certificate and NOT a second row. It is a log
-  of later ownership changes for this same certificate. Use it only to:
-    * set latest_share_holder_name to the most recent transferee named in
-      that log (if none is listed, latest_share_holder_name = share_holder_name)
+  of later ownership changes for this same certificate. Use the LAST
+  (most recent / bottom-most dated) entry in that log to:
+    * set latest_share_holder_name to that transferee's name (if the log
+      is empty, latest_share_holder_name = share_holder_name)
+    * set latest_folio_no to the "Register Folio" / "Regd. Folio" number
+      printed on that same last entry, if one is printed there (if the log
+      is empty or prints no folio, latest_folio_no = folio_no)
+      WARNING: a transfer-log entry commonly prints THREE similar-looking
+      reference numbers side by side in the same row, e.g.
+      "TRF. No.: 003025   IW. No.: 002641   FOLIO NO. 00017369". Only the
+      one actually labelled "Folio No." / "Regd. Folio" / "Register Folio"
+      is latest_folio_no. "TRF. No." / "Transfer No." is which transfer
+      this is, and "IW. No." is an unrelated internal instrument/warrant
+      number - never use either of those as latest_folio_no even though
+      they sit right next to it and are the same length.
     * append a short note to remarks, e.g. "Transferred to R MEENAKSHI on
       30/08/96"
-  Never copy a transfer-log row's own folio/certificate number into
-  folio_no or certificate_no - those numbers belong to the transfer entry,
-  not the certificate.
+  Never copy a transfer-log entry's folio or transfer number into folio_no,
+  registered_folio_no or certificate_no - those always describe the
+  ORIGINAL certificate from the front page. latest_folio_no is the one
+  exception: it is deliberately read from the transfer log, not the front.
+- The log commonly has MORE THAN ONE filled-in row (one per historical
+  transfer, oldest at the top). Read every filled row, top to bottom, and
+  build folio_no_history as: folio_no, then each row's own Folio No. in
+  order, joined with " -> " (e.g. a certificate originally on folio 000003,
+  transferred once onto folio 0015145, then again onto folio 00017369,
+  gives folio_no_history = "000003 -> 0015145 -> 00017369"). Apply the same
+  IW.No./Transfer No. vs Folio No. label check to every row, not just the
+  last one. latest_folio_no is always the LAST value in folio_no_history.
+- Build share_holder_history the same way, in lock-step with folio_no_history:
+  start with share_holder_name, then each filled row's transferee name, top
+  to bottom, joined with " -> ". Every entry in folio_no_history must have
+  a matching entry in share_holder_history at the same position - if a row
+  has a name but no readable folio, still add the name and repeat the
+  previous folio in folio_no_history at that position (do not simply drop
+  a row from one history but not the other).
 - If a later page is blank or unrelated, ignore it.
 """
 PROMPT_MULTI_PAGE = PROMPT + MULTI_PAGE_NOTE

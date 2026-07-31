@@ -331,14 +331,14 @@ def main() -> int:
         items = [(1, str(mixed / "doc_0.pdf"), None),
                  (2, str(mixed / "cert_001.jpg"), None)]
         app._render_thumbs(items, True)
-        tiles = [w for w in app.thumb_bar.winfo_children()
+        tiles = [w for w in app.thumb_inner.winfo_children()
                  if isinstance(w, tk.Frame)]
         check("a tile per file, PDF included", len(tiles) == 2, len(tiles))
         check("truncation is shown when there is more",
               any("first" in str(getattr(w, "kw", {}).get("text", ""))
-                  for w in app.thumb_bar.winfo_children()),
+                  for w in app.thumb_inner.winfo_children()),
               [getattr(w, "kw", {}).get("text") for w
-               in app.thumb_bar.winfo_children()])
+               in app.thumb_inner.winfo_children()])
 
         clicked = []
         app._open_path = lambda p: (clicked.append(p), True)[1]
@@ -351,12 +351,12 @@ def main() -> int:
 
         # A preview batch from a selection the operator has already moved on
         # from must not repaint the strip.
-        before = len([w for w in app.thumb_bar.winfo_children()
+        before = len([w for w in app.thumb_inner.winfo_children()
                       if isinstance(w, tk.Frame)])
         app.ui_queue.put(("thumbs", (app._sel_token - 1,
                                      [(1, "x.jpg", None)] * 9, False)))
         app._drain_ui_queue()
-        after = len([w for w in app.thumb_bar.winfo_children()
+        after = len([w for w in app.thumb_inner.winfo_children()
                      if isinstance(w, tk.Frame)])
         check("a stale preview batch is discarded", after == before,
               "%d -> %d" % (before, after))

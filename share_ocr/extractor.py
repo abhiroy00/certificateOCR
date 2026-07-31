@@ -160,6 +160,16 @@ class BaseEngine:
     # record.
     MAX_PAGES_PER_CERTIFICATE = 4
 
+    # The reverse page's transfer log packs 3 similar reference numbers
+    # (Transfer No. / IW. No. / Folio No.) into a few square millimetres,
+    # often over a repeating watermark. At the bulk-run defaults (200 dpi,
+    # 1600px upload cap) the model reliably confused IW. No. for the folio.
+    # This only applies to the combined front+back read (extract_document),
+    # a small fraction of total volume, so it doesn't raise cost on the
+    # single-page bulk path the 30-lakh run actually depends on.
+    MULTI_PAGE_DPI = 300
+    MULTI_PAGE_MAX_PX = 2400
+
     def __init__(self, settings: Settings):
         self.s = settings
 
@@ -182,12 +192,27 @@ class BaseEngine:
             rec["page_no"] = 1
             return [rec]
 
-        imgs = pdf_to_images(path, self.s.pdf_dpi)
+        # Render at the higher multi-page DPI first, capped just past the
+        # certificate-page threshold. If the PDF turns out to have more
+        # pages than that, it's the "genuine multi-certificate batch scan"
+        # case, and those pages get processed at the normal bulk DPI instead
+        # (no cost regression there - only the combined-read path is pricier).
+        probe = pdf_to_images(path, self.MULTI_PAGE_DPI,
+                              max_pages=self.MAX_PAGES_PER_CERTIFICATE + 1)
         try:
-            if imgs and len(imgs) <= self.MAX_PAGES_PER_CERTIFICATE:
-                rec = self.extract_document(imgs)
+            if probe and len(probe) <= self.MAX_PAGES_PER_CERTIFICATE:
+                rec = self.extract_document(probe)
                 rec["page_no"] = 1
                 return [rec]
+        finally:
+            for img in probe:
+                try:
+                    os.remove(img)
+                except OSError:
+                    pass
+
+        imgs = pdf_to_images(path, self.s.pdf_dpi)
+        try:
             records: List[Dict] = []
             for i, img in enumerate(imgs, start=1):
                 rec = self.extract_image(img)
@@ -251,7 +276,7 @@ class OpenAIEngine(BaseEngine):
             return self.extract_image(image_paths[0])
         content: List[Dict] = [{"type": "text", "text": PROMPT_MULTI_PAGE}]
         for p in image_paths:
-            b64 = downscale_to_jpeg_b64(p, self.s.max_image_px, self.s.jpeg_quality)
+            b64 = downscale_to_jpeg_b64(p, self.MULTI_PAGE_MAX_PX, self.s.jpeg_quality)
             content.append({"type": "image_url",
                             "image_url": {"url": f"data:image/jpeg;base64,{b64}",
                                           "detail": "high"}})
@@ -433,6 +458,15 @@ class TesseractEngine(BaseEngine):
         if not rec.get("registered_folio_no") and rec.get("folio_no"):
             rec["registered_folio_no"] = rec["folio_no"]
 
+        # No transfer log visible on a single page -> nothing has changed
+        # since issue, so "latest" is just what's on the front.
+        rec["latest_share_holder_name"] = (
+            rec.get("latest_share_holder_name") or rec.get("share_holder_name"))
+        rec["latest_folio_no"] = rec.get("latest_folio_no") or rec.get("folio_no")
+        rec["folio_no_history"] = rec.get("folio_no_history") or rec.get("folio_no")
+        rec["share_holder_history"] = (
+            rec.get("share_holder_history") or rec.get("share_holder_name"))
+
         rec["_raw_text"] = text[:2000]
         return rec
 
@@ -463,6 +497,10 @@ class TesseractEngine(BaseEngine):
             rec["remarks"] = merged
         rec["latest_share_holder_name"] = (
             rec.get("latest_share_holder_name") or rec.get("share_holder_name"))
+        rec["latest_folio_no"] = rec.get("latest_folio_no") or rec.get("folio_no")
+        rec["folio_no_history"] = rec.get("folio_no_history") or rec.get("folio_no")
+        rec["share_holder_history"] = (
+            rec.get("share_holder_history") or rec.get("share_holder_name"))
         return rec
 
 
@@ -557,5 +595,27 @@ def validate(rec: Dict, flag_addons: bool = True) -> str:
                 flags.append(f"Unusual face value ({fv}) - check it")
         except (TypeError, ValueError):
             pass
+
+    # 6) folio_no_history came from reading a back-page transfer log where
+    # several similar-looking reference numbers (Transfer No. / IW. No. /
+    # Folio No.) sit side by side. This has been observed to be genuinely
+    # non-deterministic - the same certificate can read correctly or
+    # incorrectly on different runs - so any row with more than one folio
+    # in its history is soft-flagged for a human to confirm by eye rather
+    # than trusted outright.
+    history = rec.get("folio_no_history") or ""
+    holder_history = rec.get("share_holder_history") or ""
+    if " -> " in str(history) or " -> " in str(holder_history):
+        flags.append("Transfer history read from transfer log - verify by eye "
+                     f"(folios: {history}; holders: {holder_history})")
+        # folio_no_history and share_holder_history are supposed to be built
+        # in lock-step, one entry per transfer row. A count mismatch means a
+        # row's folio or name was dropped on one side but not the other.
+        n_folio = str(history).count(" -> ") + 1
+        n_holder = str(holder_history).count(" -> ") + 1
+        if n_folio != n_holder:
+            flags.append(
+                f"Folio history has {n_folio} entries but holder history has "
+                f"{n_holder} - a transfer row's folio or name was dropped")
 
     return "; ".join(flags)

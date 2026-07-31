@@ -90,12 +90,18 @@ COLUMNS = [
     ("distinctive", "Distinctive No", 150),
     ("date", "Date of Issue", 115),
     ("latest", "Latest Share Holder", 180),
+    ("latestfolio", "Latest Folio No", 120),
+    ("foliohistory", "Folio No History", 200),
+    ("holderhistory", "Share Holder History", 220),
     ("remarks", "Remarks", 160),                   # add-on #11
     ("flags", "Flags", 200),
 ]
 
 MAX_TABLE_ROWS = 2000       # keep the Treeview light
-MAX_THUMBS = 12
+# The strip scrolls horizontally, so this only protects against rendering
+# thumbnails for an absurdly large folder (rasterising a PDF page per
+# thumbnail isn't free) - it is not a limit on how many you can reach.
+MAX_THUMBS = 60
 
 
 def human_eta(seconds: Optional[float]) -> str:
@@ -542,7 +548,24 @@ class App:
 
         # Thumbnail strip is packed on demand. Reserving ~96px for it when
         # nothing is selected was the single biggest band of dead space.
+        # It scrolls horizontally so a selection larger than MAX_THUMBS is
+        # still fully reachable by scrolling, not just the first screenful.
         self.thumb_bar = tk.Frame(box, bg=CARD)
+        self._thumb_canvas = tk.Canvas(self.thumb_bar, bg=CARD,
+                                       height=self.t.px(96),
+                                       highlightthickness=0)
+        thumb_scroll = ttk.Scrollbar(self.thumb_bar, orient="horizontal",
+                                     command=self._thumb_canvas.xview)
+        self._thumb_canvas.configure(xscrollcommand=thumb_scroll.set)
+        self._thumb_canvas.pack(side="top", fill="x")
+        thumb_scroll.pack(side="top", fill="x")
+        self.thumb_inner = tk.Frame(self._thumb_canvas, bg=CARD)
+        self._thumb_canvas.create_window((0, 0), window=self.thumb_inner,
+                                         anchor="nw")
+        self.thumb_inner.bind(
+            "<Configure>",
+            lambda e: self._thumb_canvas.configure(
+                scrollregion=self._thumb_canvas.bbox("all")))
 
         wrap = ttk.Frame(box, style="Card.TFrame")
         wrap.pack(fill="both", expand=True, pady=(px(8), 0))
@@ -705,7 +728,7 @@ class App:
         if token is None:
             self._sel_token += 1
             token = self._sel_token
-        for w in self.thumb_bar.winfo_children():
+        for w in self.thumb_inner.winfo_children():
             w.destroy()
         self._thumb_imgs.clear()
         if not paths:
@@ -714,7 +737,7 @@ class App:
         # Show the strip only when there is something in it.
         self.thumb_bar.pack(fill="x", pady=(self.t.px(8), 0),
                             before=self._table_wrap)
-        tk.Label(self.thumb_bar, text="Rendering previews…", bg=CARD, fg=MUTED,
+        tk.Label(self.thumb_inner, text="Rendering previews…", bg=CARD, fg=MUTED,
                  font=self.t.f(-2)).pack(side="left", padx=4)
         # Previews are built off the UI thread: a PDF page has to be rasterised
         # to preview it, and a dozen of those on the UI thread freezes the
@@ -736,11 +759,11 @@ class App:
         self.ui_queue.put(("thumbs", (token, items, more)))
 
     def _render_thumbs(self, items, more: bool) -> None:
-        for w in self.thumb_bar.winfo_children():
+        for w in self.thumb_inner.winfo_children():
             w.destroy()
         self._thumb_imgs.clear()
         for i, src, thumb in items:
-            holder = tk.Frame(self.thumb_bar, bg=CARD, cursor="hand2")
+            holder = tk.Frame(self.thumb_inner, bg=CARD, cursor="hand2")
             holder.pack(side="left", padx=4)
             if thumb:
                 try:
@@ -768,7 +791,7 @@ class App:
             for w in (holder, body, cap):
                 w.bind("<Button-1>", lambda e, p=src: self._open_preview(p))
         if more:
-            tk.Label(self.thumb_bar,
+            tk.Label(self.thumb_inner,
                      text=f"…  first {MAX_THUMBS} of the selection",
                      bg=CARD, fg=MUTED, font=self.t.f(-2)).pack(
                 side="left", padx=8)
@@ -926,8 +949,9 @@ class App:
                 row.get("certificate_no", ""), row.get("share_holder_name", ""),
                 row.get("no_of_shares", ""), row.get("face_value_per_share", ""),
                 row.get("share_type", ""), dist, row.get("date_of_issue", ""),
-                row.get("latest_share_holder_name", ""), row.get("remarks", ""),
-                row.get("validation_flags", "")),
+                row.get("latest_share_holder_name", ""), row.get("latest_folio_no", ""),
+                row.get("folio_no_history", ""), row.get("share_holder_history", ""),
+                row.get("remarks", ""), row.get("validation_flags", "")),
             tags=tags)
         children = self.tree.get_children()
         if len(children) > MAX_TABLE_ROWS:
@@ -1126,7 +1150,7 @@ class App:
             return
         self.pipeline.clear()
         self.tree.delete(*self.tree.get_children())
-        for w in self.thumb_bar.winfo_children():
+        for w in self.thumb_inner.winfo_children():
             w.destroy()
         self.row_count = 0
         self.selected_paths = []
