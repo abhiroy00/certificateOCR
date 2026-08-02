@@ -49,6 +49,11 @@ coverage.xml
 # OpenAI key (obfuscated, machine-bound). Must never reach a remote.
 credentials.json
 
+# Real SMTP sender credentials (Gmail App Password) used to email OTP codes
+# to the administrator. smtp_config.example.json IS tracked - it is the
+# template, with no real password.
+smtp_config.json
+
 # ------------------------------------------------- app runtime artefacts --
 # These normally live in ~/.share_ocr, but land in the repo whenever
 # SHARE_OCR_HOME is pointed here (or --workdir is set to the project).

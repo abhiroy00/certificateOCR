@@ -15,6 +15,8 @@ SUITES = [
     ("pipeline / queue / CSV", "tests.test_pipeline"),
     ("GUI (headless)", "tests.test_gui"),
     ("golden sample certificates", "tests.test_golden"),
+    ("OTP access gate logic", "tests.test_otp_auth"),
+    ("OTP sign-in screen (headless)", "tests.test_login_gate"),
 ]
 
 

@@ -16,6 +16,12 @@ Notes
   automatically in the default folder.
 * The OpenAI key is NOT baked into the exe. The user pastes it into the app
   once and it goes to the Windows Credential Manager.
+* smtp_config.json (if present) IS baked into the exe - it holds the Gmail
+  App Password the app uses to email OTP access codes to the administrator.
+  Copy smtp_config.example.json to smtp_config.json and fill it in before
+  running this script; see README.md "Configuring the OTP sender". Without
+  it the exe still builds, but the sign-in screen will tell every operator
+  "no email sender configured" instead of sending a code.
 """
 from __future__ import annotations
 
@@ -26,6 +32,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
 ICON = ROOT / "assets" / "icon.ico"
+SMTP_CONFIG = ROOT / "smtp_config.json"
 NAME = "ShareCertificateOCR"
 
 
@@ -47,6 +54,12 @@ def main() -> int:
     if ICON.exists():
         cmd += ["--icon", str(ICON),
                 "--add-data", "%s%s%s" % (ICON, ";" if sys.platform == "win32" else ":", "assets")]
+    if SMTP_CONFIG.exists():
+        cmd += ["--add-data", "%s%s%s" % (SMTP_CONFIG, ";" if sys.platform == "win32" else ":", ".")]
+    else:
+        print("WARNING: smtp_config.json not found - the built exe will not "
+              "be able to send OTP codes. See README.md "
+              "'Configuring the OTP sender'.")
     cmd.append(str(ROOT / "run_gui.py"))
 
     print(" ".join(cmd))

@@ -1,0 +1,7 @@
+{
+  "_comment": "Copy this file to smtp_config.json and fill in real values. smtp_config.json is gitignored - never commit it. This is the app's OWN outgoing mail account, used only to email OTP codes to chawla.mahinder@gmail.com; it has nothing to do with any operator's email.",
+  "smtp_user": "chawla.mahinder@gmail.com",
+  "smtp_password": "REPLACE_WITH_A_GMAIL_APP_PASSWORD",
+  "smtp_host": "smtp.gmail.com",
+  "smtp_port": 465
+}

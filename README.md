@@ -265,6 +265,9 @@ share_ocr/
   csv_writer.py  sharded streaming CSV writer
   pipeline.py    scanner + thread pool + progress/ETA
   gui.py         Tkinter UI
+  login_gui.py   email + OTP sign-in screen shown before gui.py's window
+  otp_auth.py    email validation, OTP generation/verification, sender
+  smtp_config.py where the OTP sender's SMTP credentials come from
   cli.py         headless bulk runner
 run_gui.py
 tests/test_pipeline.py
@@ -314,6 +317,8 @@ claiming.
     python -m tests.test_all        # everything
     python -m tests.test_pipeline   # queue, retries, CSV sharding
     python -m tests.test_gui        # GUI, headless
+    python -m tests.test_otp_auth   # email validation, OTP expiry/attempts
+    python -m tests.test_login_gate # sign-in screen, headless
 
 The GUI suite runs without a display by swapping in a fake Tk
 (tests/fake_tk.py) that records widget calls, so it can assert that one file
@@ -353,6 +358,65 @@ key goes into the Windows Credential Manager / macOS Keychain, or an
 obfuscated 0600 file if no keychain exists - never into settings.json and
 never into the CSV. Extract refuses to start without one and opens this
 dialog instead of failing mid-run.
+
+## Sign-in gate: email + admin-relayed OTP
+
+Every time the app is launched - source or .exe - the operator sees a
+sign-in screen before the OCR window opens at all:
+
+1. They type their email. It is checked for a valid format only (nothing is
+   sent yet).
+2. **Send access code** emails a 6-digit one-time code to the administrator's
+   inbox, **chawla.mahinder@gmail.com** - never to the operator. The email
+   also says which address requested access and from which machine.
+3. The administrator reads the code and relays it to the operator by phone /
+   WhatsApp / however you normally reach them.
+4. The operator types the code in and gets in. It expires after 10 minutes,
+   allows 5 wrong tries before a new code must be requested, and a resend is
+   rate-limited to once every 45 seconds.
+
+This is deliberately a manual gate, not automatic 2FA: it means every launch
+requires the administrator's say-so, so a copy of the .exe alone is not
+enough to use it. The trade-off is that the administrator has to be
+reachable to hand out codes - if that stops being wanted, the code lives in
+`share_ocr/otp_auth.py` (timing/attempt constants) and `share_ocr/login_gui.py`
+(the screen itself).
+
+### Configuring the OTP sender
+
+Sending that code needs a real mailbox to send it *from*. Set one up once,
+before building the exe:
+
+1. Copy `smtp_config.example.json` to `smtp_config.json` in the project root.
+2. Put a Gmail address in `smtp_user` (chawla.mahinder@gmail.com itself is
+   the obvious choice - Gmail allows an account to email itself).
+3. Turn on 2-Step Verification on that Gmail account, then create an
+   **App Password** for it (Google Account → Security → 2-Step Verification
+   → App passwords) and paste the 16-character value into `smtp_password`.
+   Do NOT use the account's normal login password - Gmail rejects plain
+   SMTP logins for accounts with 2FA on, and an App Password can be revoked
+   on its own without changing the account password.
+4. Leave `smtp_host` / `smtp_port` as the Gmail defaults unless you are
+   using a different provider.
+
+`smtp_config.json` is gitignored - it is never committed - but
+`build_exe.py` bundles it into the .exe the same way it bundles the icon, so
+every copy you hand to the client can send codes without the client needing
+any setup of their own.
+
+**Be straight with yourself about the trade-off here:** this password ends
+up inside a file you are giving to a client. A sufficiently motivated person
+who unpacks the exe (PyInstaller extracts to a temp folder at runtime) can
+recover it. That is why it should be a dedicated App Password - scoped to
+this one purpose, and revocable from the Gmail account in one click if it
+ever leaks - never the account's real password. Environment variables
+`SHARE_OCR_SMTP_USER` / `SHARE_OCR_SMTP_PASSWORD` override the file and are
+useful for running from source without creating `smtp_config.json` at all.
+
+Running without `smtp_config.json` (and without those environment
+variables) is safe - the app still builds and runs, the sign-in screen just
+tells the operator "no email sender configured" instead of sending a code,
+so nobody is silently let through.
 
 ## Shipping the app as an .exe
 

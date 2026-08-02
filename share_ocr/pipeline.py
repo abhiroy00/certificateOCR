@@ -35,8 +35,16 @@ log = logging.getLogger("share_ocr")
 
 # ------------------------------------------------------------------ scan --
 def scan_paths(root: str, exts: Tuple[str, ...] = SUPPORTED_EXT) -> Iterator[Tuple[str, str, int]]:
-    """Recursively yield (path, name, size). Uses os.scandir -> constant memory."""
-    root_p = Path(root)
+    """Recursively yield (path, name, size). Uses os.scandir -> constant memory.
+
+    The root is resolved to an absolute, canonical path first. The queue's
+    uniqueness check is a literal string match on path, so the same
+    physical file reached via a relative root in one session and an
+    absolute root in another (e.g. a script run from the project folder
+    vs. the GUI's folder-picker, which always returns an absolute path)
+    would otherwise be queued - and billed for - twice.
+    """
+    root_p = Path(root).resolve()
     if root_p.is_file():
         if root_p.suffix.lower() in exts:
             yield str(root_p), root_p.name, root_p.stat().st_size

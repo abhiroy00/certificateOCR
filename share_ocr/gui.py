@@ -1241,14 +1241,27 @@ def main() -> None:
     settings = Settings.load()
     root = TkinterDnD.Tk() if _DND else tk.Tk()
     set_app_icon(root)
-    app = App(root, settings)
+
+    # Every launch requires a fresh email + admin-relayed OTP before the OCR
+    # tool becomes reachable - see login_gui.LoginGate / otp_auth.py.
+    from .login_gui import LoginGate
+
+    app_holder: dict = {}
+
+    def _launch_app() -> None:
+        app_holder["app"] = App(root, settings)
+
+    LoginGate(root, on_success=_launch_app)
+
     try:
         root.mainloop()
     except KeyboardInterrupt:
-        try:
-            app._on_close()
-        except Exception:                             # noqa: BLE001
-            pass
+        app = app_holder.get("app")
+        if app is not None:
+            try:
+                app._on_close()
+            except Exception:                         # noqa: BLE001
+                pass
 
 
 if __name__ == "__main__":
