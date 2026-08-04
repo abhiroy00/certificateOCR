@@ -367,7 +367,7 @@ sign-in screen before the OCR window opens at all:
 1. They type their email. It is checked for a valid format only (nothing is
    sent yet).
 2. **Send access code** emails a 6-digit one-time code to the administrator's
-   inbox, **chawla.mahinder@gmail.com** - never to the operator. The email
+   inbox, **chawlamahinder65@gmail.com** - never to the operator. The email
    also says which address requested access and from which machine.
 3. The administrator reads the code and relays it to the operator by phone /
    WhatsApp / however you normally reach them.
@@ -388,7 +388,7 @@ Sending that code needs a real mailbox to send it *from*. Set one up once,
 before building the exe:
 
 1. Copy `smtp_config.example.json` to `smtp_config.json` in the project root.
-2. Put a Gmail address in `smtp_user` (chawla.mahinder@gmail.com itself is
+2. Put a Gmail address in `smtp_user` (chawlamahinder65@gmail.com itself is
    the obvious choice - Gmail allows an account to email itself).
 3. Turn on 2-Step Verification on that Gmail account, then create an
    **App Password** for it (Google Account → Security → 2-Step Verification

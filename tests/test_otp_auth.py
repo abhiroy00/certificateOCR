@@ -69,7 +69,7 @@ def main() -> int:
 
     print("\n[4] SMTP credential loading")
     check("admin address is the fixed inbox",
-          SC.ADMIN_EMAIL == "chawla.mahinder@gmail.com", SC.ADMIN_EMAIL)
+          SC.ADMIN_EMAIL == "chawlamahinder65@gmail.com", SC.ADMIN_EMAIL)
 
     print("\n[5] send_otp_email fails loudly with no credentials configured")
     import os

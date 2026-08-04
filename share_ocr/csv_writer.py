@@ -66,6 +66,13 @@ class ShardedCsvWriter:
         with self._lock:
             self._flush_locked()
 
+    def pending(self) -> int:
+        """Rows accepted by write() but not yet on disk - non-zero here
+        means the last flush attempt failed (e.g. the CSV shard was open
+        in Excel) and the rows are only in memory."""
+        with self._lock:
+            return len(self._buf)
+
     def _flush_locked(self) -> None:
         if self._buf:
             self._append(self._shard_path(), self._buf)
@@ -94,26 +101,26 @@ class ShardedCsvWriter:
 
     @staticmethod
     def _repair_header_if_stale(path: Path) -> None:
-        """A shard written before a new field existed still has the old,
-        shorter header. New fields are always appended at the end of
-        CSV_COLUMNS (never inserted in the middle - that would silently
-        misalign every column after the insertion point for rows already
-        on disk), so fixing this is just rewriting the header line: old
-        rows simply have nothing in the new trailing column(s), which is
-        the correct, honest answer for data that was never extracted."""
+        """A shard written under an older CSV_COLUMNS still has the old
+        header - a field may since have been added, dropped, or both.
+        Re-reading every row by column NAME (DictReader) and rewriting it
+        against the current CSV_COLUMNS keeps the file a clean, aligned
+        CSV either way: a genuinely new column comes back blank for old
+        rows (the honest answer for data that was never extracted), and a
+        removed column's old values are simply dropped."""
         with path.open("r", encoding="utf-8-sig", newline="") as f:
             header_line = f.readline()
         current = next(csv.reader([header_line]), [])
-        if current == CSV_COLUMNS or not current:
+        if not current or current == CSV_COLUMNS:
             return
-        if CSV_COLUMNS[:len(current)] != current:
-            return   # not a clean prefix match - do not guess, leave as-is
         with path.open("r", encoding="utf-8-sig", newline="") as f:
-            f.readline()
-            rest = f.read()
+            rows = list(csv.DictReader(f))
         with path.open("w", encoding="utf-8-sig", newline="") as f:
-            csv.writer(f).writerow(CSV_COLUMNS)
-            f.write(rest)
+            w = csv.DictWriter(f, fieldnames=CSV_COLUMNS, extrasaction="ignore",
+                               restval="")
+            w.writeheader()
+            for r in rows:
+                w.writerow(r)
 
     def close(self) -> None:
         self.flush()

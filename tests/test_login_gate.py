@@ -69,7 +69,7 @@ def main() -> int:
         check("OTP field appears after a successful send", gate.otp_frame.packed)
         check("send button re-enabled", gate.send_btn.cget("state") == "normal")
         check("status names the admin inbox",
-              "chawla.mahinder@gmail.com" in gate.status.cget("text"),
+              "chawlamahinder65@gmail.com" in gate.status.cget("text"),
               gate.status.cget("text"))
 
         print("\n[3] wrong code is rejected, right code finishes the gate")

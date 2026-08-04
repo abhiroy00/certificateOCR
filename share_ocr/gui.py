@@ -255,8 +255,10 @@ class App:
                       command=self.open_api_key_dialog).pack(
             side="right", padx=(0, px(8)))
 
+        # Not packed: the client operator does not need to see the raw key
+        # status text, only the "API key" button above to set one. The
+        # widgets still exist because _refresh_key_status() configures them.
         chip = tk.Frame(inner, bg=CARD, cursor="hand2")
-        chip.pack(side="right", padx=(0, px(10)))
         self.key_dot = tk.Label(chip, text="\u25cf", bg=CARD, fg=MUTED,
                                 font=t.f(0))
         self.key_dot.pack(side="left", padx=(0, px(5)))
@@ -266,10 +268,11 @@ class App:
         for w in (chip, self.key_dot, self.key_label):
             w.bind("<Button-1>", lambda e: self.open_api_key_dialog())
 
-        # Settings sit on ONE line: label beside field. The old "LABEL above
-        # field" stack cost a whole extra row of height and read like a form.
+        # Not packed: engine/workers/model are operator-facing knobs the
+        # client should not see or change - they ship pre-set in
+        # settings.json. The widgets still exist so the rest of App (engine
+        # switching, key-status refresh, tests) keeps working unchanged.
         cfg = ttk.Frame(inner, style="Card.TFrame")
-        cfg.pack(side="right", padx=(0, px(16)))
 
         ttk.Label(cfg, text="Engine", style="Field.TLabel").pack(
             side="left", padx=(0, px(6)))

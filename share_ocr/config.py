@@ -55,8 +55,6 @@ ADDON_FIELDS: List[str] = [
 CSV_COLUMNS: List[str] = [
     "row_id",
     "source_file",
-    "source_path",
-    "page_no",
     "company_name",
     "share_type",
     "folio_no",
@@ -72,9 +70,6 @@ CSV_COLUMNS: List[str] = [
     "distinctive_to",
     "date_of_issue",
     "validation_flags",
-    "engine",
-    "model",
-    "latency_ms",
     "extracted_at",
     "latest_folio_no",     # appended at the end, not inserted mid-list, so
                            # existing CSV shards from before this field
@@ -82,6 +77,10 @@ CSV_COLUMNS: List[str] = [
     "folio_no_history",    # same reason - always append, never insert
     "share_holder_history",
 ]
+# source_path, page_no, engine, model and latency_ms are internal/operator
+# fields (the client doesn't need them in the deliverable). They still live
+# in queue.db - the "Open" button in the GUI reads source_path from there,
+# not from the CSV - dropping them here only changes what gets exported.
 
 PROMPT = """You are extracting data from a scanned SHARE CERTIFICATE image.
 Return ONLY a valid JSON object with EXACTLY these keys:

@@ -187,7 +187,7 @@ class Pipeline:
     def join(self) -> None:
         for t in self._threads:
             t.join()
-        self._safe_flush()
+        self._drain_flush()
 
     @property
     def running(self) -> bool:
@@ -284,7 +284,7 @@ class Pipeline:
             if self.on_progress:
                 self.on_progress(self.stats)
             time.sleep(1.0)
-        self._safe_flush()
+        self._drain_flush()
         if self.on_progress:
             self.on_progress(self.stats)
 
@@ -294,6 +294,23 @@ class Pipeline:
         except Exception as e:                      # noqa: BLE001
             self.on_log(f"WARN: CSV flush failed ({type(e).__name__}: {e}) - "
                        "close the CSV file if it is open in Excel.")
+
+    def _drain_flush(self, attempts: int = 15, delay: float = 2.0) -> None:
+        """Keep retrying after work stops, not just once.
+
+        A single failed flush (e.g. the CSV shard is open in Excel at the
+        exact moment extraction finishes) used to strand rows in memory
+        until the app was closed and reopened - nothing kept retrying once
+        the worker threads and the 1s reporter loop had both exited. This
+        gives a locked file up to `attempts * delay` seconds to free up
+        (closing Excel, say) before giving up and leaving the WARN log as
+        the only trace.
+        """
+        for _ in range(attempts):
+            self._safe_flush()
+            if self.csv.pending() == 0:
+                return
+            time.sleep(delay)
 
     # ----------------------------------------------------------- misc --
     def counts(self) -> Dict[str, int]:

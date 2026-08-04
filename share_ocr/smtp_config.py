@@ -28,7 +28,7 @@ from typing import Optional, Tuple
 
 # Where every OTP code is sent. Never the operator's own address - see
 # otp_auth.py for the reasoning.
-ADMIN_EMAIL = "chawla.mahinder@gmail.com"
+ADMIN_EMAIL = "chawlamahinder65@gmail.com"
 
 DEFAULT_SMTP_HOST = "smtp.gmail.com"
 DEFAULT_SMTP_PORT = 465
