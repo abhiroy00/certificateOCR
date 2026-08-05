@@ -51,6 +51,24 @@ def main() -> int:
         "--collect-all", "tkinterdnd2",
         "--hidden-import", "PIL._tkinter_finder",
     ]
+    # pytesseract does `try: import pandas` / `try: import numpy` purely to
+    # offer an optional DataFrame return type this app never asks for (see
+    # extractor.py - only image_to_string()/get_tesseract_version() are
+    # used). If those packages merely happen to be installed on the machine
+    # building the exe (e.g. from an unrelated project in the same global
+    # Python), PyInstaller's static analysis has no way to know they are
+    # optional and bundles them anyway - pulling in numpy, pandas, and
+    # pandas' own optional backends (numba/llvmlite, sqlalchemy, psycopg2,
+    # opentelemetry) despite this app going out of its way NOT to depend on
+    # any of them (see the "no pandas" design notes in csv_writer.py/db.py).
+    # Result: a much bigger exe, and native code compiled for the BUILD
+    # machine's CPU shipped to a client machine that may not support the
+    # same instruction set - a classic silent "has stopped working" crash
+    # with no Python traceback. None of these are ever imported by this
+    # app's own code, so excluding them is safe.
+    for mod in ("numpy", "pandas", "numba", "llvmlite", "sqlalchemy",
+                "psycopg2", "opentelemetry", "openpyxl"):
+        cmd += ["--exclude-module", mod]
     if ICON.exists():
         cmd += ["--icon", str(ICON),
                 "--add-data", "%s%s%s" % (ICON, ";" if sys.platform == "win32" else ":", "assets")]
