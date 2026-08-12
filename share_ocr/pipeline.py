@@ -258,24 +258,22 @@ class Pipeline:
         # undo that or mark the file failed - it would put the file back in
         # the pending/failed pool, get re-claimed on the next Extract click,
         # and pay for the same OpenAI call again for data we already have.
-        out_rows = [
-            record_to_row(rec, row_id=rid, name=name, path=path,
-                          engine=engine.name, model=self.s.model,
-                          latency_ms=latency)
-            for rid, rec in zip(row_ids, records)
-        ]
+        csv_rows = [record_to_row(rec, name=name) for rec in records]
         try:
-            self.csv.write_many(out_rows)
+            self.csv.write_many(csv_rows)
             q.mark_exported(row_ids)
         except Exception as e:                      # noqa: BLE001
             self.on_log(f"WARN {name}: extracted OK but CSV write failed "
                        f"({type(e).__name__}: {e}) - close the CSV file if "
                        "it is open in Excel. It writes automatically once "
                        "the file is free again.")
-        self.stats.bump(done=1, rows=len(out_rows))
+        self.stats.bump(done=1, rows=len(csv_rows))
         if self.on_row:
-            for row in out_rows:
-                self.on_row(row)
+            # The GUI table + delete path work in internal (snake_case) keys,
+            # not the pretty CSV headers - feed them the raw record plus the
+            # bits the table needs (source_file, row_id).
+            for rid, rec in zip(row_ids, records):
+                self.on_row({**rec, "source_file": name, "row_id": rid})
 
     # -------------------------------------------------------- reporter --
     def _reporter(self) -> None:
@@ -324,8 +322,12 @@ class Pipeline:
         put the source file back to pending so Extract can redo it."""
         if not row_ids:
             return 0
+        # row_id is not exported any more, so look up how each row is
+        # identified in the CSV (Source File + CertificateNo) BEFORE deleting
+        # it from the DB, then use that to drop it from the shards.
+        signatures = self.q.result_signatures(row_ids)
         deleted = self.q.delete_results(row_ids, requeue=requeue)
-        self.csv.remove_rows(row_ids)
+        self.csv.remove_rows(signatures)
         return deleted
 
     def clear(self) -> None:

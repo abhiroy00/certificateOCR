@@ -77,10 +77,11 @@ def main() -> int:
           "distinctive span" in validate(short), validate(short))
 
     print("\n[5] every scored field is present in the CSV layout")
-    from share_ocr.config import CSV_COLUMNS
+    from share_ocr.config import HEADER_TO_KEY
+    exported = set(HEADER_TO_KEY.values())      # internal keys the CSV carries
     sys.path.insert(0, str(ROOT / "tools"))
     import check_accuracy
-    missing = [f for f in check_accuracy.SCORED if f not in CSV_COLUMNS]
+    missing = [f for f in check_accuracy.SCORED if f not in exported]
     check("accuracy tool only scores real CSV columns", not missing, missing)
 
     print("\n%d passed, %d failed" % (PASS, FAIL))

@@ -65,8 +65,11 @@ def main() -> int:
     shards = sorted(s.csv_dir.glob("certificates-part-*.csv"))
     assert len(shards) >= 2, f"expected shards, got {shards}"
     merged = p.export_single_csv(str(tmp / "certificates.csv"))
+    # The CSV uses pretty headers now; normalise back to internal keys.
+    from share_ocr.config import HEADER_TO_KEY
     with open(merged, encoding="utf-8-sig", newline="") as f:
-        rows = list(csv.DictReader(f))
+        rows = [{HEADER_TO_KEY.get(k, k): v for k, v in r.items()}
+                for r in csv.DictReader(f)]
     assert len(rows) == n, f"merged csv has {len(rows)} rows"
     assert rows[0]["company_name"].startswith("TEST COMPANY"), rows[0]["company_name"]
     assert rows[0]["distinctive_from"].isdigit(), rows[0]["distinctive_from"]

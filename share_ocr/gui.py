@@ -530,10 +530,10 @@ class App:
                               bd=0)
         self.badge.pack(side="left", padx=px(10))
 
+        # Only "All" is shown; the "Needs review" filter was removed by
+        # request. filter_var stays so the row-filtering code paths keep a
+        # valid value to read (it is always "all" now).
         self.filter_var = tk.StringVar(value="all")
-        ttk.Radiobutton(head, text="Needs review", value="review",
-                        variable=self.filter_var,
-                        command=self._reload_table).pack(side="right")
         ttk.Radiobutton(head, text="All", value="all", variable=self.filter_var,
                         command=self._reload_table).pack(side="right", padx=px(12))
 

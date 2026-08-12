@@ -309,6 +309,27 @@ class Queue:
             " WHERE r.row_id = ?", (row_id,)).fetchone()
         return r[0] if r else None
 
+    def result_signatures(self, row_ids: Sequence[int]) -> List[tuple]:
+        """(source_file, certificate_no) for each row_id - how a row is
+        identified in the exported CSV now that row_id itself is not a
+        column (used by "Delete selected", see csv_writer.remove_rows)."""
+        ids = [int(i) for i in row_ids]
+        if not ids:
+            return []
+        placeholders = ",".join("?" * len(ids))
+        rows = self.conn.execute(
+            f"SELECT r.payload, f.name FROM results r"
+            f" JOIN files f ON f.id = r.file_id"
+            f" WHERE r.row_id IN ({placeholders})", ids).fetchall()
+        out = []
+        for payload, name in rows:
+            try:
+                cert = json.loads(payload).get("certificate_no") or ""
+            except Exception:                              # noqa: BLE001
+                cert = ""
+            out.append((name, cert))
+        return out
+
     def recent_rows(self, limit: int = 200) -> List[sqlite3.Row]:
         self.conn.row_factory = sqlite3.Row
         return self.conn.execute(

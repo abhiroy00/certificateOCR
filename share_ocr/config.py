@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import List
@@ -36,6 +37,7 @@ FIELDS: List[str] = [
     "date_of_issue",
     "latest_share_holder_name",
     "latest_folio_no",
+    "latest_issue_date",     # date of the most recent transfer/endorsement
     "folio_no_history",
     "share_holder_history",
     "face_value_per_share",  # add-on #10 in the quotation
@@ -52,35 +54,77 @@ ADDON_FIELDS: List[str] = [
     "registered_folio_no",
 ]
 
-CSV_COLUMNS: List[str] = [
-    "row_id",
-    "source_file",
-    "company_name",
-    "share_type",
-    "folio_no",
-    "registered_folio_no",
-    "certificate_no",
-    "share_holder_name",
-    "latest_share_holder_name",
-    "no_of_shares",
-    "no_of_shares_words",
-    "face_value_per_share",
-    "remarks",
-    "distinctive_from",
-    "distinctive_to",
-    "date_of_issue",
-    "validation_flags",
-    "extracted_at",
-    "latest_folio_no",     # appended at the end, not inserted mid-list, so
-                           # existing CSV shards from before this field
-                           # existed don't get every later column shifted
-    "folio_no_history",    # same reason - always append, never insert
-    "share_holder_history",
+# The deliverable CSV layout, in order. Each entry is (header shown in the
+# file, where its value comes from). The source is an extraction field name,
+# or one of the specials filled in by csv_writer.record_to_row:
+#   @review        -> "Yes"/"No" (Yes when the row carries any validation flag)
+#   @source_file   -> the scanned file's name
+#   @extracted_at  -> UTC timestamp of extraction
+# Headers are the actual CSV dict keys, so renaming/reordering here is all it
+# takes to change the export. row_id and no_of_shares_words are deliberately
+# absent (dropped from the client deliverable); row_id still lives in
+# queue.db, and "Delete selected" matches CSV rows on Source File +
+# CertificateNo instead (see csv_writer.remove_rows).
+CSV_SPEC = [
+    ("Review", "@review"),
+    ("Source File", "@source_file"),
+    ("Script Name", "company_name"),
+    ("Script_type", "share_type"),
+    ("Initial Folio No", "folio_no"),
+    ("Initial Folio No_2", "registered_folio_no"),
+    ("CertificateNo", "certificate_no"),
+    ("First Share Holder Name", "share_holder_name"),
+    ("Present Share Holder Name", "latest_share_holder_name"),
+    ("No of Shares", "no_of_shares"),
+    ("Face Value Per Share", "face_value_per_share"),
+    ("From Distinctive No", "distinctive_from"),
+    ("To Distinctive No.", "distinctive_to"),
+    ("Date of Issue", "date_of_issue"),
+    ("Present Transfer Date", "latest_issue_date"),
+    ("Present Folio No", "latest_folio_no"),
+    ("Remarks", "remarks"),
+    ("Validation Flags", "validation_flags"),
+    ("Folio No History", "folio_no_history"),
+    ("Share Holder History", "share_holder_history"),
+    ("Extracted At", "@extracted_at"),
 ]
-# source_path, page_no, engine, model and latency_ms are internal/operator
-# fields (the client doesn't need them in the deliverable). They still live
-# in queue.db - the "Open" button in the GUI reads source_path from there,
-# not from the CSV - dropping them here only changes what gets exported.
+
+CSV_COLUMNS: List[str] = [header for header, _ in CSV_SPEC]
+
+# Pretty header -> internal key. The @specials map to the plain names the
+# rest of the code (GUI, DB payload, accuracy tool) already uses, so a tool
+# reading the exported CSV can normalise it straight back to internal keys.
+_SPECIAL_TO_KEY = {"@review": "review", "@source_file": "source_file",
+                   "@extracted_at": "extracted_at"}
+HEADER_TO_KEY = {
+    header: _SPECIAL_TO_KEY.get(src, src) for header, src in CSV_SPEC
+}
+
+# Columns used to identify a row for "Delete selected" now that row_id is not
+# exported (see csv_writer.remove_rows / pipeline.delete_rows).
+SOURCE_FILE_HEADER = next(h for h, s in CSV_SPEC if s == "@source_file")
+CERT_NO_HEADER = next(h for h, s in CSV_SPEC if s == "certificate_no")
+
+# The "Review" column is "Yes" only for rows with a HARD problem. These two
+# advisories are SOFT: they fire on perfectly good rows - a billed add-on the
+# certificate simply doesn't print, or a transfer log worth an eyeball - so on
+# their own they leave Review = "No". That keeps Review mostly "No", flagging
+# only rows a human genuinely needs to look at. The full text still appears in
+# the Validation Flags column either way.
+_SOFT_TRANSFER = re.compile(
+    r"Transfer history read from transfer log[^(]*\([^)]*\)")
+_SOFT_ADDON = re.compile(r"Add-on not captured:[^;]*")
+
+
+def review_verdict(validation_flags) -> str:
+    """"Yes"/"No" for the Review column, from a validation-flags string."""
+    s = (validation_flags or "").strip()
+    if not s:
+        return "No"
+    s = _SOFT_TRANSFER.sub("", s)
+    s = _SOFT_ADDON.sub("", s)
+    # Anything with letters still standing is a hard flag.
+    return "Yes" if re.search(r"[A-Za-z]", s) else "No"
 
 PROMPT = """You are extracting data from a scanned SHARE CERTIFICATE image.
 Return ONLY a valid JSON object with EXACTLY these keys:
@@ -103,6 +147,12 @@ Rules:
   "Register Folio" / "Regd. Folio" number (printed next to the transferee
   in the endorsement, transfer stamp, or Memorandum of Transfers), return
   that new folio number here. Else latest_folio_no = folio_no.
+- latest_issue_date = the DATE of the most recent transfer/endorsement - the
+  date on which the shares were last transferred to the present holder
+  (printed in the endorsement, transfer stamp, or the bottom-most dated row
+  of the Memorandum of Transfers), in ISO format YYYY-MM-DD. If the
+  certificate shows NO transfer/endorsement at all, use null (do not fall
+  back to date_of_issue).
 - folio_no_history = every distinct folio number this certificate has ever
   been registered under, oldest first, as a single string separated by
   " -> " (e.g. "000003 -> 0015145 -> 00017369"). Start with folio_no (the
@@ -203,6 +253,9 @@ sheet, or a continuation). Return ONE JSON record for the whole certificate
       this is, and "IW. No." is an unrelated internal instrument/warrant
       number - never use either of those as latest_folio_no even though
       they sit right next to it and are the same length.
+    * set latest_issue_date to the DATE printed on that same last (most
+      recent) transfer entry, in ISO format YYYY-MM-DD (if the log is empty,
+      latest_issue_date = null)
     * append a short note to remarks, e.g. "Transferred to R MEENAKSHI on
       30/08/96"
   Never copy a transfer-log entry's folio or transfer number into folio_no,

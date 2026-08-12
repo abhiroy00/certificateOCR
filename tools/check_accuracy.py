@@ -41,7 +41,6 @@ SCORED = [
     "certificate_no",
     "share_holder_name",
     "no_of_shares",
-    "no_of_shares_words",
     "face_value_per_share",
     "distinctive_from",
     "distinctive_to",
@@ -87,9 +86,17 @@ def main(argv) -> int:
     truth = json.loads(TRUTH.read_text("utf-8"))["certificates"]
     by_file = {c["source_file"]: c for c in truth}
 
+    # The exported CSV uses pretty headers ("Script Name", ...); normalise
+    # each row back to the internal snake_case keys this tool scores on.
+    from share_ocr.config import HEADER_TO_KEY
+
+    def _internal(r):
+        return {HEADER_TO_KEY.get(k, k): v for k, v in r.items()}
+
     with open(csv_path, encoding="utf-8-sig", newline="") as f:
-        rows = [r for r in csv.DictReader(f)
-                if r.get("source_file") in by_file]
+        rows = [ir for r in csv.DictReader(f)
+                for ir in [_internal(r)]
+                if ir.get("source_file") in by_file]
 
     if not rows:
         print("None of the ground-truth files appear in that CSV.")
