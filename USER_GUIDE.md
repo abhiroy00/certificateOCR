@@ -14,17 +14,18 @@ Opens the folder where the CSV files and the working database are kept
 output without going through **Download CSV**. Nothing is changed by
 clicking it - it only opens Explorer / Finder.
 
-### API key
-Opens the key dialog described in section 2. This is where the OpenAI key
-lives; you never edit a file or set an environment variable.
+### API keys
+Opens the key manager described in section 2. This is where OpenAI keys
+live; you never edit a file or set an environment variable. You can add as
+many keys as you have - 4, 10, however many - not just one.
 
 ### The coloured dot next to it
-A one-glance status of the key:
+A one-glance status of the key pool:
 
 | Dot | Text | Meaning |
 |---|---|---|
-| Grey | `Add OpenAI API key` | No key found. Extraction with the OpenAI engine will refuse to start. |
-| Green | `Key sk-...abcd (Windows Credential Manager)` | A key is available, and where it was found. |
+| Grey | `Add OpenAI API key(s)` | No key found. Extraction with the OpenAI engine will refuse to start. |
+| Green | `3 API keys (Windows Credential Manager)` | That many keys are available, and where they were found. |
 | Grey | `API key not needed` | The Tesseract engine is selected, which runs offline. |
 
 ### Engine
@@ -48,9 +49,11 @@ to the point where your connection or the API rate limit becomes the
 bottleneck.
 
 * 4-8 for a laptop doing a few thousand.
-* 16-32 for a bulk run on a good connection.
-* Start lower if you see rate-limit messages in the status bar; the app
-  backs off and retries on its own, but fewer workers is smoother.
+* 16-32 for a bulk run on a good connection, especially with several API
+  keys added (section 2) so the load spreads across them.
+* If the rate (images/second, in the status bar) is lower than you expect,
+  add more keys before adding more workers - a bigger key pool absorbs rate
+  limits more effectively than raw worker count.
 
 Changing it mid-run takes effect on the next run, not the current one.
 
@@ -73,34 +76,46 @@ paying the high price on all 30 lakh images.
 
 ---
 
-## 2. The API key dialog
+## 2. The API keys dialog
 
-### The key box
-Paste your key here. It looks like `sk-...`. Get it from
-https://platform.openai.com/api-keys.
+### Why more than one key
+Extraction spreads requests across every key you have added. The moment one
+key hits its rate limit or runs out of credit, the app automatically moves
+to the next key instead of failing the image - so a single key's limit
+never stalls a run, and you should never need to manually retry anything.
+For a large job (lakhs of images), add every key you have; the more keys in
+the pool, the smoother the run.
 
-### Show key
-Uncovers the text so you can check what you pasted. Off by default so the
-key is not visible over someone's shoulder or in a screen share.
+### The list of keys
+Each saved key is shown masked (e.g. `sk-proj…4f2A`), with its own **Test**
+and **Remove** buttons.
 
 ### Test
-Makes one tiny call to OpenAI and reports back. Use this before a big run -
-it is the difference between finding out now and finding out after 200
-failed images. It tells you specifically whether the key is invalid, out of
-credit, or blocked by a firewall.
-
-### Save
-Stores the key and closes. It goes into the Windows Credential Manager (or
-the macOS Keychain), and only into an encoded file in your user folder if no
-keychain is available. It is **never** written into the settings file, the
-log, or the CSV, so you can hand a CSV to a client safely.
+Makes one tiny call to OpenAI with that specific key and reports back -
+whether it is valid, out of credit, or blocked by a firewall. Use this
+before a big run for every key you add.
 
 ### Remove
-Deletes the stored key from this machine. Use it before handing the computer
-to someone else.
+Deletes that one key from this machine, immediately. The others in the pool
+keep working.
+
+### Add key
+Paste a key (looks like `sk-...`, get one from
+https://platform.openai.com/api-keys) and press **Add key**. It is saved and
+added to the pool right away - repeat for every key you have. Keys go into
+the Windows Credential Manager (or the macOS Keychain), and only into an
+encoded file in your user folder if no keychain is available. They are
+**never** written into the settings file, the log, or the CSV, so you can
+hand a CSV to a client safely.
+
+### Show key while typing
+Uncovers the text in the entry box so you can check what you pasted before
+adding it. Off by default so a key is not visible over someone's shoulder or
+in a screen share.
 
 ### Close
-Closes without saving changes.
+Closes the dialog. Keys are saved as soon as you press **Add key** or
+**Remove**, not on Close.
 
 ---
 
@@ -132,11 +147,13 @@ Ends the run. Everything already read is saved. You can close the app
 entirely and press **Extract** again later - it picks up where it left off
 and does not re-read or re-charge for files already done.
 
-### Retry failed
-Re-queues only the rows that errored (network drop, rate limit, corrupt
-file). Rows that were read successfully are left alone. Change the model to
-a stronger one first if the failures were accuracy problems rather than
-network problems.
+### There is no "Retry failed" button
+There does not need to be one. A rate limit or a dropped connection on one
+key automatically moves that request to the next key in your pool (see
+section 2) - the file still gets read on the same pass. A file that
+genuinely cannot be read (a corrupt scan) is simply left out of the results;
+pressing **Extract** again later still picks up anything left pending
+without re-reading or re-charging for files already done.
 
 ### "Nothing selected" / "1,240 files selected"
 Just tells you what **Extract** is about to work on.
@@ -171,6 +188,10 @@ A row lands in **Needs review** when something does not add up:
 One row per certificate. Columns match the CSV exactly. Double-click a row
 to open the original image, so you can compare against the scan without
 hunting for the file.
+
+**The exported CSV works the same way in Excel.** The File Name column in
+the CSV is a live link - click it and Excel opens the exact scan that row
+came from, the same as double-clicking the row here.
 
 ### The thumbnails
 A quick visual check that the right images are being processed - useful for

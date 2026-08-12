@@ -89,9 +89,16 @@ def main(argv) -> int:
     # The exported CSV uses pretty headers ("Script Name", ...); normalise
     # each row back to the internal snake_case keys this tool scores on.
     from share_ocr.config import HEADER_TO_KEY
+    from share_ocr.csv_writer import display_name
 
     def _internal(r):
-        return {HEADER_TO_KEY.get(k, k): v for k, v in r.items()}
+        row = {HEADER_TO_KEY.get(k, k): v for k, v in r.items()}
+        # Source File is written as an Excel HYPERLINK() formula so it opens
+        # the scan when clicked (see csv_writer.hyperlink_cell) - pull the
+        # plain file name back out so matching against ground truth still
+        # works on the raw exported CSV, not just what Excel displays.
+        row["source_file"] = display_name(row.get("source_file", ""))
+        return row
 
     with open(csv_path, encoding="utf-8-sig", newline="") as f:
         rows = [ir for r in csv.DictReader(f)

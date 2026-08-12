@@ -241,7 +241,16 @@ class Pipeline:
                                    self.s.max_attempts)
             if status == db.DEAD:
                 self.stats.bump(failed=1)
-            self.on_log(f"ERROR {name}: {type(e).__name__}: {e}")
+            # Logged to the file only (share_ocr.log), never pushed through
+            # on_log - the GUI status bar must never flash a scary per-file
+            # error. The multi-key pool (see extractor.KeyPool) already
+            # retries a rate-limited/quota-exhausted key against every other
+            # configured key before a file ever gets here, and the queue
+            # itself retries a merely 'failed' file automatically on the
+            # next claim - so what reaches this branch is either a genuine
+            # bad file or every key having failed, neither of which a
+            # "Retry failed" click would fix anyway.
+            log.warning("extraction failed for %s: %s: %s", name, type(e).__name__, e)
             # backoff on rate limits / transient network failures
             msg = str(e).lower()
             if any(k in msg for k in ("rate limit", "429", "timeout", "connection",
@@ -258,7 +267,7 @@ class Pipeline:
         # undo that or mark the file failed - it would put the file back in
         # the pending/failed pool, get re-claimed on the next Extract click,
         # and pay for the same OpenAI call again for data we already have.
-        csv_rows = [record_to_row(rec, name=name) for rec in records]
+        csv_rows = [record_to_row(rec, name=name, source_path=path) for rec in records]
         try:
             self.csv.write_many(csv_rows)
             q.mark_exported(row_ids)

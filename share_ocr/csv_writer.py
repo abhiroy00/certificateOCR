@@ -8,6 +8,7 @@ and a `_needs_review.csv` sidecar collects every flagged row.
 from __future__ import annotations
 
 import csv
+import re
 import threading
 from datetime import datetime, timezone
 from pathlib import Path
@@ -15,6 +16,45 @@ from typing import Dict, List, Optional
 
 from .config import (CERT_NO_HEADER, CSV_COLUMNS, CSV_SPEC,
                      SOURCE_FILE_HEADER, review_verdict)
+
+# ------------------------------------------------------ Source File links --
+# The "Source File" column is written as an Excel HYPERLINK() formula rather
+# than plain text, so clicking the file name in the exported CSV opens the
+# actual scan (Excel evaluates a cell as a formula whenever its content,
+# after CSV parsing, starts with "="). This is a second, independent
+# escaping layer from CSV's own quoting: csv.writer already doubles quote
+# characters and wraps the field when IT serializes this string, so the only
+# thing done by hand here is doubling a literal quote so it survives as part
+# of the formula's own string literal. Windows forbids '"' in file/folder
+# names outright, so in practice this never triggers on the paths this app
+# actually writes - it exists for robustness on other platforms.
+_HYPERLINK_RE = re.compile(
+    r'^=HYPERLINK\(\s*"((?:[^"]|"")*)"\s*,\s*"((?:[^"]|"")*)"\s*\)$',
+    re.IGNORECASE | re.DOTALL)
+
+
+def hyperlink_cell(path: Optional[str], display: str) -> str:
+    """A Source File cell that opens `path` when clicked in Excel, showing
+    `display` as the visible text. Falls back to plain `display` text when
+    there is no path to link to (older shards never recorded one)."""
+    if not path:
+        return display
+    esc = lambda s: (s or "").replace('"', '""')           # noqa: E731
+    return '=HYPERLINK("%s","%s")' % (esc(path), esc(display))
+
+
+def display_name(value: str) -> str:
+    """The plain file name behind a Source File cell, whether it holds a
+    HYPERLINK() formula (current shards) or plain text (shards written
+    before this feature, or a value that isn't a recognised formula at
+    all). Used anywhere a row needs to be matched by file name rather than
+    by its raw cell text - see remove_rows()/_rewrite_without()."""
+    if not value:
+        return value
+    m = _HYPERLINK_RE.match(value.strip())
+    if not m:
+        return value
+    return m.group(2).replace('""', '"')
 
 
 class ShardedCsvWriter:
@@ -187,7 +227,7 @@ class ShardedCsvWriter:
             rows = [ShardedCsvWriter._migrate_row(r) for r in csv.DictReader(f)]
 
         def sig(r):
-            return (str(r.get(SOURCE_FILE_HEADER, "")),
+            return (display_name(str(r.get(SOURCE_FILE_HEADER, ""))),
                     str(r.get(CERT_NO_HEADER, "")))
 
         kept = [r for r in rows if sig(r) not in sigset]
@@ -221,9 +261,12 @@ class ShardedCsvWriter:
         return dest
 
 
-def record_to_row(rec: Dict, *, name: str) -> Dict:
+def record_to_row(rec: Dict, *, name: str, source_path: Optional[str] = None) -> Dict:
     """Flatten an extraction record into the deliverable CSV row, keyed by
-    the pretty headers in CSV_SPEC. `name` is the scanned file's name."""
+    the pretty headers in CSV_SPEC. `name` is the scanned file's name;
+    `source_path` (when known) is its absolute path on disk, which turns
+    the Source File cell into a clickable Excel link that opens that exact
+    scan - see hyperlink_cell()."""
     flags = rec.get("validation_flags") or ""
     extracted_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
     row: Dict = {}
@@ -231,7 +274,7 @@ def record_to_row(rec: Dict, *, name: str) -> Dict:
         if src == "@review":
             row[header] = review_verdict(flags)
         elif src == "@source_file":
-            row[header] = name
+            row[header] = hyperlink_cell(source_path, name)
         elif src == "@extracted_at":
             row[header] = extracted_at
         else:

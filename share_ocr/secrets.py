@@ -1,4 +1,4 @@
-"""Safe storage for the OpenAI API key.
+"""Safe storage for the OpenAI API key(s).
 
 Threat model, stated honestly so nobody is misled:
 
@@ -11,8 +11,9 @@ Threat model, stated honestly so nobody is misled:
 
 Storage backends, in the order they are read:
 
-  1. Environment variable (OPENAI_API_KEY). Highest priority, never written by
-     us. This is what you use on a server / in CI.
+  1. Environment variable (OPENAI_API_KEYS, comma/semicolon/newline separated,
+     or the single-key OPENAI_API_KEY). Highest priority, never written by us.
+     This is what you use on a server / in CI.
   2. OS credential store via `keyring`: Windows Credential Manager, macOS
      Keychain, or Secret Service on Linux. The OS encrypts it against your
      login. This is the recommended option and what the GUI defaults to.
@@ -21,7 +22,14 @@ Storage backends, in the order they are read:
      keyring (bare Linux boxes, portable installs). It is obfuscation, not
      encryption - the UI says so out loud.
 
-The key is never written to settings.json and never passed to the logger.
+Multiple keys can be stored at once (the GUI's "API keys" dialog supports as
+many as the operator wants to add). extractor.KeyPool round-robins across all
+of them and moves a request to the next key when one is rate-limited or out
+of quota, so a run does not stall or dead-letter a file just because one key
+hit its limit - the point being that with several keys in the pool, a
+"Retry failed" click should never be necessary.
+
+The key(s) are never written to settings.json and never passed to the logger.
 """
 from __future__ import annotations
 
@@ -31,13 +39,16 @@ import hashlib
 import json
 import os
 import platform
+import re
 import stat
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import List, Optional, Tuple
 
 SERVICE = "share_ocr"
-ACCOUNT = "openai_api_key"
+ACCOUNT = "openai_api_key"           # legacy single-key entry, read-only now
+ACCOUNT_KEYS = "openai_api_keys"     # current entry: a JSON array of keys
 CRED_FILENAME = "credentials.json"
+_SPLIT_RE = re.compile(r"[,\n;]+")
 
 SOURCE_ENV = "env"
 SOURCE_KEYRING = "keyring"
@@ -135,7 +146,8 @@ def _lock_down(path: Path) -> None:
         pass
 
 
-def _read_file_key(workdir: Path) -> Optional[str]:
+def _read_legacy_file_key(workdir: Path) -> Optional[str]:
+    """The single-key entry a pre-multi-key install may still have on disk."""
     p = _cred_path(workdir)
     if not p.exists():
         return None
@@ -147,19 +159,41 @@ def _read_file_key(workdir: Path) -> Optional[str]:
         return None
 
 
-def _write_file_key(workdir: Path, value: str) -> None:
+def _read_file_keys(workdir: Path) -> List[str]:
+    p = _cred_path(workdir)
+    if not p.exists():
+        return []
+    try:
+        data = json.loads(p.read_text("utf-8"))
+    except Exception:                                      # noqa: BLE001
+        return []
+    blob = data.get(ACCOUNT_KEYS)
+    if blob:
+        plain = _deobfuscate(blob)
+        if plain:
+            try:
+                parsed = json.loads(plain)
+                if isinstance(parsed, list):
+                    return [str(k).strip() for k in parsed if str(k).strip()]
+            except Exception:                              # noqa: BLE001
+                pass
+    legacy = _read_legacy_file_key(workdir)
+    return [legacy] if legacy and legacy.strip() else []
+
+
+def _write_file_keys(workdir: Path, keys: List[str]) -> None:
     p = _cred_path(workdir)
     p.parent.mkdir(parents=True, exist_ok=True)
     payload = {
         "_comment": "Obfuscated, machine-bound. Do NOT commit or copy to "
                     "another machine. Prefer the OS credential store.",
-        ACCOUNT: _obfuscate(value),
+        ACCOUNT_KEYS: _obfuscate(json.dumps(keys)),
     }
     p.write_text(json.dumps(payload, indent=2), encoding="utf-8")
     _lock_down(p)
 
 
-def _delete_file_key(workdir: Path) -> bool:
+def _delete_file_keys(workdir: Path) -> bool:
     p = _cred_path(workdir)
     if p.exists():
         try:
@@ -170,75 +204,151 @@ def _delete_file_key(workdir: Path) -> bool:
     return False
 
 
+def _dedupe(keys) -> List[str]:
+    seen, out = set(), []
+    for k in keys:
+        k = (k or "").strip()
+        if k and k not in seen:
+            seen.add(k)
+            out.append(k)
+    return out
+
+
 # --------------------------------------------------------- public API -----
 
-def resolve(settings) -> Tuple[Optional[str], str]:
-    """Return (key, source). Precedence: env > keyring > file."""
+def _keys_from_env(settings) -> List[str]:
+    multi = os.environ.get("OPENAI_API_KEYS")
+    if multi and multi.strip():
+        return _dedupe(_SPLIT_RE.split(multi))
     env_name = getattr(settings, "api_key_env", "OPENAI_API_KEY")
-    val = os.environ.get(env_name)
-    if val and val.strip():
-        return val.strip(), SOURCE_ENV
+    single = os.environ.get(env_name)
+    return [single.strip()] if single and single.strip() else []
+
+
+def _keys_from_keyring() -> List[str]:
+    try:
+        import keyring
+
+        raw = keyring.get_password(SERVICE, ACCOUNT_KEYS)
+        if raw:
+            try:
+                parsed = json.loads(raw)
+                if isinstance(parsed, list):
+                    keys = [str(k).strip() for k in parsed if str(k).strip()]
+                    if keys:
+                        return keys
+            except Exception:                              # noqa: BLE001
+                pass
+        legacy = keyring.get_password(SERVICE, ACCOUNT)
+        return [legacy.strip()] if legacy and legacy.strip() else []
+    except Exception:                                      # noqa: BLE001
+        return []
+
+
+def resolve_all(settings) -> Tuple[List[str], str]:
+    """Return (keys, source). Precedence: env > keyring > file.
+
+    Every worker draws from this same list via extractor.KeyPool, which
+    rotates across all of them and moves a request to the next key rather
+    than failing the file when one key is rate-limited or out of quota.
+    """
+    keys = _keys_from_env(settings)
+    if keys:
+        return keys, SOURCE_ENV
 
     if keyring_available():
-        try:
-            import keyring
+        keys = _keys_from_keyring()
+        if keys:
+            return keys, SOURCE_KEYRING
 
-            val = keyring.get_password(SERVICE, ACCOUNT)
-            if val and val.strip():
-                return val.strip(), SOURCE_KEYRING
-        except Exception:                                  # noqa: BLE001
-            pass
+    keys = _read_file_keys(Path(settings.workdir))
+    if keys:
+        return keys, SOURCE_FILE
 
-    val = _read_file_key(Path(settings.workdir))
-    if val and val.strip():
-        return val.strip(), SOURCE_FILE
+    return [], SOURCE_NONE
 
-    return None, SOURCE_NONE
+
+def list_api_keys(settings) -> List[str]:
+    return resolve_all(settings)[0]
+
+
+def resolve(settings) -> Tuple[Optional[str], str]:
+    """Return (first key, source) - kept for callers that only need to know
+    whether *a* key is available (e.g. the "Extract" button's guard)."""
+    keys, source = resolve_all(settings)
+    return (keys[0], source) if keys else (None, SOURCE_NONE)
 
 
 def get_api_key(settings) -> Optional[str]:
     return resolve(settings)[0]
 
 
-def save_api_key(settings, key: str, prefer_keyring: bool = True) -> str:
-    """Persist the key. Returns the source it was written to.
-
-    Raises RuntimeError if nothing could be written.
-    """
-    key = (key or "").strip()
-    if not key:
-        raise ValueError("Empty key")
+def save_api_keys(settings, keys: List[str], prefer_keyring: bool = True) -> str:
+    """Persist the whole key list, replacing whatever was stored before.
+    Returns the source it was written to. Raises ValueError if `keys` is
+    empty - use delete_all_api_keys() to clear the pool instead."""
+    keys = _dedupe(keys)
+    if not keys:
+        raise ValueError("No keys to save")
 
     if prefer_keyring and keyring_available():
         try:
             import keyring
 
-            keyring.set_password(SERVICE, ACCOUNT, key)
-            # If a stale plaintext-ish fallback exists, remove it so there is
-            # exactly one copy on disk.
-            _delete_file_key(Path(settings.workdir))
+            keyring.set_password(SERVICE, ACCOUNT_KEYS, json.dumps(keys))
+            try:                                # drop the legacy single entry
+                if keyring.get_password(SERVICE, ACCOUNT):
+                    keyring.delete_password(SERVICE, ACCOUNT)
+            except Exception:                                  # noqa: BLE001
+                pass
+            # exactly one copy on disk once the keyring holds the pool
+            _delete_file_keys(Path(settings.workdir))
             return SOURCE_KEYRING
-        except Exception:                                  # noqa: BLE001
+        except Exception:                                      # noqa: BLE001
             pass
 
-    _write_file_key(Path(settings.workdir), key)
+    _write_file_keys(Path(settings.workdir), keys)
     return SOURCE_FILE
 
 
-def delete_api_key(settings) -> list:
-    """Remove the key from every place we control. Returns what was cleared.
-    The environment variable is not ours to unset - we report it instead."""
+def add_api_key(settings, key: str) -> str:
+    """Add one key to the pool (a no-op if it is already there)."""
+    key = (key or "").strip()
+    if not key:
+        raise ValueError("Empty key")
+    current = list_api_keys(settings)
+    if key in current:
+        return resolve_all(settings)[1]
+    return save_api_keys(settings, current + [key])
+
+
+def remove_api_key(settings, key: str) -> str:
+    """Drop one key from the pool. Returns the resulting source (SOURCE_NONE
+    if that was the last key)."""
+    remaining = [k for k in list_api_keys(settings) if k != key]
+    if not remaining:
+        delete_all_api_keys(settings)
+        return SOURCE_NONE
+    return save_api_keys(settings, remaining)
+
+
+def delete_all_api_keys(settings) -> list:
+    """Remove every stored key from every place we control. Returns what was
+    cleared. The environment variable is not ours to unset - callers should
+    treat it as still authoritative if it is set."""
     cleared = []
     if keyring_available():
         try:
             import keyring
 
-            if keyring.get_password(SERVICE, ACCOUNT):
-                keyring.delete_password(SERVICE, ACCOUNT)
-                cleared.append(SOURCE_KEYRING)
-        except Exception:                                  # noqa: BLE001
+            for account in (ACCOUNT_KEYS, ACCOUNT):
+                if keyring.get_password(SERVICE, account):
+                    keyring.delete_password(SERVICE, account)
+                    if SOURCE_KEYRING not in cleared:
+                        cleared.append(SOURCE_KEYRING)
+        except Exception:                                      # noqa: BLE001
             pass
-    if _delete_file_key(Path(settings.workdir)):
+    if _delete_file_keys(Path(settings.workdir)):
         cleared.append(SOURCE_FILE)
     return cleared
 
@@ -259,13 +369,16 @@ def looks_like_openai_key(key: str) -> bool:
 
 
 def describe(settings) -> dict:
-    """Everything the UI needs to render the key status."""
-    key, source = resolve(settings)
+    """Everything the UI needs to render the key pool status."""
+    keys, source = resolve_all(settings)
     return {
-        "configured": bool(key),
+        "configured": bool(keys),
+        "count": len(keys),
+        "keys": keys,                              # in-process only; never logged
+        "masked_list": [mask(k) for k in keys],
         "source": source,
         "source_label": SOURCE_LABELS[source],
-        "masked": mask(key),
+        "masked": mask(keys[0]) if keys else "—",
         "env_name": getattr(settings, "api_key_env", "OPENAI_API_KEY"),
         "keyring": keyring_available(),
         "keyring_backend": keyring_backend_name(),

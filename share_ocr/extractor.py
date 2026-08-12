@@ -20,12 +20,13 @@ import re
 import shutil
 import tempfile
 import threading
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional
 
 from .config import ADDON_FIELDS, FIELDS, PROMPT, PROMPT_MULTI_PAGE, Settings
-from .secrets import get_api_key
+from .secrets import list_api_keys
 
 
 # ---------------------------------------------------------------- helpers --
@@ -227,46 +228,148 @@ class BaseEngine:
                     pass
 
 
+class KeyPool:
+    """Round-robins requests across every configured OpenAI API key.
+
+    The GUI's "API keys" dialog lets an operator add as many keys as they
+    want (4, 10, whatever their OpenAI account setup allows). Spreading
+    requests across all of them and moving a request to the next key the
+    moment one is rate-limited or out of quota is what lets a bulk run avoid
+    ever needing a manual "retry failed" step - the pool self-heals instead
+    of the file dead-lettering.
+
+    Shared across every worker thread (see `_pool_for`), because the whole
+    point is a global rotation: if each thread kept its own round-robin
+    pointer and cooldown state, two threads could hammer the same key at
+    once while another sat idle.
+    """
+
+    def __init__(self, keys: List[str]):
+        self.keys = list(keys)
+        self._lock = threading.Lock()
+        self._idx = 0
+        self._cooldown_until: Dict[str, float] = {}
+
+    def __bool__(self) -> bool:
+        return bool(self.keys)
+
+    def cooldown(self, key: str, seconds: float) -> None:
+        with self._lock:
+            self._cooldown_until[key] = time.time() + seconds
+
+    def order(self) -> List[str]:
+        """Keys to try for one request, starting from the next round-robin
+        slot, healthy keys before ones still cooling down from a recent
+        rate-limit/quota error."""
+        with self._lock:
+            if not self.keys:
+                return []
+            n = len(self.keys)
+            seq = [self.keys[(self._idx + i) % n] for i in range(n)]
+            self._idx = (self._idx + 1) % n
+            now = time.time()
+            healthy = [k for k in seq if self._cooldown_until.get(k, 0) <= now]
+            cooling = [k for k in seq if k not in healthy]
+        return healthy + cooling
+
+
+_pool_cache: Dict[tuple, KeyPool] = {}
+_pool_cache_lock = threading.Lock()
+
+
+def _pool_for(settings: Settings) -> KeyPool:
+    """One KeyPool per distinct key set + base_url, shared across threads."""
+    keys = tuple(list_api_keys(settings))
+    cache_key = (keys, settings.base_url)
+    with _pool_cache_lock:
+        pool = _pool_cache.get(cache_key)
+        if pool is None:
+            pool = KeyPool(list(keys))
+            _pool_cache[cache_key] = pool
+        return pool
+
+
 class OpenAIEngine(BaseEngine):
     name = "openai"
+
+    # How long a key sits out after hitting a rate limit / quota error
+    # before being tried again - long enough that OpenAI's per-minute window
+    # has actually reset. An auth error (bad/revoked key) parks it much
+    # longer, since that will not fix itself.
+    RATE_LIMIT_COOLDOWN_S = 30.0
+    AUTH_ERROR_COOLDOWN_S = 3600.0
 
     def __init__(self, settings: Settings):
         super().__init__(settings)
         from openai import OpenAI
 
-        kwargs = {"timeout": settings.request_timeout,
-                  "max_retries": 0}  # we do our own backoff in the worker
-        if settings.base_url:
-            kwargs["base_url"] = settings.base_url
-        # Resolved from env -> OS keychain -> obfuscated local file.
-        # Never read straight out of settings.json; the key is not stored there.
-        key = get_api_key(settings)
-        if not key:
+        self._OpenAI = OpenAI
+        self.pool = _pool_for(settings)
+        if not self.pool:
             raise RuntimeError(
-                "No OpenAI API key configured. Set it in the GUI "
-                "(Settings -> API key), run `python -m share_ocr.cli key --set`, "
-                f"or export {settings.api_key_env}.")
-        kwargs["api_key"] = key
-        self.client = OpenAI(**kwargs)
+                "No OpenAI API key configured. Add one or more keys in the "
+                "GUI (the API keys button), run `python -m share_ocr.cli key "
+                f"--set`, or export {settings.api_key_env} / OPENAI_API_KEYS.")
+        self._client_kwargs = {"timeout": settings.request_timeout,
+                               "max_retries": 0}  # we do our own backoff
+        if settings.base_url:
+            self._client_kwargs["base_url"] = settings.base_url
+        self._clients: Dict[str, object] = {}
+        self._clients_lock = threading.Lock()
+
+    def _client_for(self, key: str):
+        client = self._clients.get(key)
+        if client is None:
+            with self._clients_lock:
+                client = self._clients.get(key)
+                if client is None:
+                    client = self._OpenAI(api_key=key, **self._client_kwargs)
+                    self._clients[key] = client
+        return client
+
+    def _complete(self, messages: List[Dict]) -> Dict:
+        """Call chat.completions, trying every key in the pool (healthiest
+        first) before giving up. A rate-limit/quota error on one key just
+        moves to the next; only a non-key-related error, or every key
+        failing, raises."""
+        order = self.pool.order()
+        last_exc: Optional[Exception] = None
+        for key in order:
+            try:
+                resp = self._client_for(key).chat.completions.create(
+                    model=self.s.model,
+                    temperature=0,
+                    response_format={"type": "json_object"},
+                    messages=messages,
+                )
+                data = json.loads(resp.choices[0].message.content)
+                return {k: data.get(k) for k in FIELDS}
+            except Exception as e:                          # noqa: BLE001
+                last_exc = e
+                msg = str(e).lower()
+                if any(s in msg for s in ("rate limit", "429", "quota",
+                                          "insufficient_quota", "overloaded",
+                                          "503", "502")):
+                    self.pool.cooldown(key, self.RATE_LIMIT_COOLDOWN_S)
+                    continue
+                if any(s in msg for s in ("401", "invalid_api_key",
+                                          "incorrect api key", "account_deactivated")):
+                    self.pool.cooldown(key, self.AUTH_ERROR_COOLDOWN_S)
+                    continue
+                raise  # not key-related - trying another key would not help
+        raise last_exc or RuntimeError("No OpenAI API key available")
 
     def extract_image(self, image_path: str) -> Dict:
         b64 = downscale_to_jpeg_b64(image_path, self.s.max_image_px, self.s.jpeg_quality)
-        resp = self.client.chat.completions.create(
-            model=self.s.model,
-            temperature=0,
-            response_format={"type": "json_object"},
-            messages=[{
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": PROMPT},
-                    {"type": "image_url",
-                     "image_url": {"url": f"data:image/jpeg;base64,{b64}",
-                                   "detail": "high"}},
-                ],
-            }],
-        )
-        data = json.loads(resp.choices[0].message.content)
-        return {k: data.get(k) for k in FIELDS}
+        return self._complete([{
+            "role": "user",
+            "content": [
+                {"type": "text", "text": PROMPT},
+                {"type": "image_url",
+                 "image_url": {"url": f"data:image/jpeg;base64,{b64}",
+                               "detail": "high"}},
+            ],
+        }])
 
     def extract_document(self, image_paths: List[str]) -> Dict:
         """Read every page of one certificate in a single request, so a
@@ -280,14 +383,7 @@ class OpenAIEngine(BaseEngine):
             content.append({"type": "image_url",
                             "image_url": {"url": f"data:image/jpeg;base64,{b64}",
                                           "detail": "high"}})
-        resp = self.client.chat.completions.create(
-            model=self.s.model,
-            temperature=0,
-            response_format={"type": "json_object"},
-            messages=[{"role": "user", "content": content}],
-        )
-        data = json.loads(resp.choices[0].message.content)
-        return {k: data.get(k) for k in FIELDS}
+        return self._complete([{"role": "user", "content": content}])
 
 
 class TesseractEngine(BaseEngine):

@@ -82,6 +82,14 @@ validation_flags, engine, model, latency_ms, extracted_at`
 
 CSV is written as UTF-8-BOM so Excel opens Indian names correctly.
 
+**Source File is a clickable link.** That column is written as an Excel
+`HYPERLINK()` formula pointing at the scan's absolute path on disk, with the
+file name as the visible text - clicking it in Excel opens the original
+image/PDF directly, no hunting through folders. See
+`csv_writer.hyperlink_cell` / `display_name`. Tools that read the CSV
+programmatically (e.g. `tools/check_accuracy.py`) call `display_name()` to
+get the plain file name back out of that cell.
+
 ### Billed add-on fields (#10, #11, #12)
 
 These three are optional add-ons in the quotation, so they get extra handling —
@@ -192,15 +200,22 @@ bar, so the eye goes to the data. Row tints: **blue** = a billed add-on is
 missing, **amber** = a core field failed validation, alternating **`#fafbfd`**
 otherwise. A legend above the table explains both.
 
-## Where to put the OpenAI API key
+## Where to put the OpenAI API key(s)
 
-There is no need to touch the terminal. Open the GUI and click **API key** in
-the top bar (the coloured dot next to it is red until a key is configured,
-green once it is). Paste the key, pick where to store it, hit **Save**. Use
-**Test connection** to confirm the key works before you queue three million
-images.
+There is no need to touch the terminal. Open the GUI and click **API keys**
+in the top bar (the coloured dot next to it is red until at least one key is
+configured, green once it is). Paste a key and press **Add key** - repeat
+for as many keys as you have. Use **Test** next to any key to confirm it
+works before you queue three million images.
 
-The same thing from the command line, with hidden input so the key never lands
+**Why more than one key matters:** extraction round-robins across every key
+in the pool and moves a request to the next key the instant one hits a rate
+limit or runs out of quota (see `extractor.KeyPool`), instead of failing the
+file. With a handful of keys in the pool, a single key's limit essentially
+never stalls or fails a run - there is deliberately no manual "retry failed"
+button in the GUI, because the pool is meant to make one unnecessary.
+
+The same thing from the command line, with hidden input so a key never lands
 in your shell history or in `ps` output:
 
 ```bash
@@ -210,13 +225,13 @@ python -m share_ocr.cli key           # show status (masked)
 python -m share_ocr.cli key --remove  # delete it from this machine
 ```
 
-### The three places a key can come from
+### The three places keys can come from
 
-Read in this order, first hit wins:
+Read in this order, first hit wins - each source can hold multiple keys:
 
 | # | Source | When to use it | Safety |
 |---|--------|----------------|--------|
-| 1 | `OPENAI_API_KEY` environment variable | Servers, CI, the 30-lakh batch run | Never written to disk by us. Always overrides the two below. |
+| 1 | `OPENAI_API_KEYS` environment variable (comma/semicolon/newline separated), or the single-key `OPENAI_API_KEY` | Servers, CI, the 30-lakh batch run | Never written to disk by us. Always overrides the two below. |
 | 2 | OS credential store (`keyring`) | **Default for the desktop GUI** | Encrypted by Windows Credential Manager / macOS Keychain / Linux Secret Service against your login. |
 | 3 | `<workdir>/credentials.json` | Machines with no keyring (bare Linux, portable installs) | Permissions `0600`, obfuscated with a machine-bound pad. |
 

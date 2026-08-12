@@ -31,8 +31,9 @@ from .config import (APP_NAME, APP_VERSION, SUPPORTED_DOC, SUPPORTED_EXT,
                      SUPPORTED_IMG, Settings)
 from .extractor import make_thumbnail
 from .pipeline import Pipeline, Stats, scan_paths
-from .secrets import (delete_api_key, describe, looks_like_openai_key, mask,
-                      resolve, save_api_key, test_key)
+from .secrets import (add_api_key, describe, list_api_keys,
+                      looks_like_openai_key, mask, remove_api_key, resolve,
+                      test_key)
 from .theme import (AMBER_TINT, BG, BLUE, BLUE_EDGE, BLUE_HOVER, BLUE_TINT,
                     BORDER, CARD, GREEN, INK, INK_SOFT, MUTED, RED, ZEBRA,
                     apply_theme, card, enable_hidpi)
@@ -249,9 +250,10 @@ class App:
         RoundedButton(inner, text="Output folder", variant="secondary",
                       theme=t, command=self._open_output).pack(side="right")
 
-        # API key button + status chip. The customer gets the .exe, not the
-        # source, so this is the only place a key can be entered.
-        RoundedButton(inner, text="API key", variant="secondary", theme=t,
+        # API keys button + status chip. The customer gets the .exe, not the
+        # source, so this is the only place keys can be entered. Supports as
+        # many keys as the operator wants to add - see open_api_key_dialog.
+        RoundedButton(inner, text="API keys", variant="secondary", theme=t,
                       command=self.open_api_key_dialog).pack(
             side="right", padx=(0, px(8)))
 
@@ -333,61 +335,56 @@ class App:
 
     # ---------------------------------------------------------- api key --
     def _refresh_key_status(self) -> None:
-        """Update the toolbar chip: green = usable key, grey = none needed."""
+        """Update the toolbar chip: green = at least one usable key."""
         info = describe(self.s)
         if self.s.engine != "openai":
             self.key_dot.configure(fg=MUTED)
             self.key_label.configure(text="API key not needed")
         elif info["configured"]:
+            n = info["count"]
             self.key_dot.configure(fg=GREEN)
             self.key_label.configure(
-                text="Key %s  (%s)" % (info["masked"], info["source_label"]))
+                text="%d API key%s  (%s)" % (
+                    n, "" if n == 1 else "s", info["source_label"]))
         else:
             self.key_dot.configure(fg=RED)
-            self.key_label.configure(text="Add OpenAI API key")
+            self.key_label.configure(text="Add OpenAI API key(s)")
 
     def open_api_key_dialog(self) -> None:
-        """Enter / test / remove the OpenAI key. Never echoed to the screen."""
+        """Manage the pool of OpenAI API keys - add as many as you like.
+
+        Every worker draws from this shared pool (extractor.KeyPool) and
+        automatically moves to the next key if one is rate-limited or out of
+        quota, instead of failing the file. That is what lets a run avoid
+        ever needing a manual retry: the more keys in the pool, the less any
+        single key's limit can stall or fail a job. Keys are never echoed to
+        the screen by default and never written to the CSV, the log or the
+        queue database.
+        """
         t, px = self.t, self.t.px
-        info = describe(self.s)
         win = tk.Toplevel(self.root)
-        win.title("OpenAI API key")
+        win.title("OpenAI API keys")
         win.configure(bg=BG)
         win.transient(self.root)
         win.resizable(False, False)
 
         body = ttk.Frame(win, style="Card.TFrame", padding=(px(16), px(14)))
         body.pack(fill="both", expand=True)
-        ttk.Label(body, text="OpenAI API key", style="Section.TLabel").pack(anchor="w")
-        ttk.Label(body, style="Muted.TLabel", wraplength=px(420), justify="left",
-                  text=("Stored in your operating system's credential manager "
-                        "when available, otherwise in an obfuscated file that "
-                        "only your user account can read. It is never written "
-                        "to the CSV, the log or the queue database.")
+        ttk.Label(body, text="OpenAI API keys", style="Section.TLabel").pack(anchor="w")
+        ttk.Label(body, style="Muted.TLabel", wraplength=px(460), justify="left",
+                  text=("Add one or more keys. Extraction spreads requests "
+                        "across all of them and switches to the next key the "
+                        "moment one hits a rate limit or runs out of quota, "
+                        "so one key's limit never stalls or fails a run. "
+                        "Stored in your operating system's credential "
+                        "manager when available, otherwise in an obfuscated "
+                        "file only your user account can read.")
                   ).pack(anchor="w", pady=(px(4), px(10)))
 
-        key_var = tk.StringVar(value="")
-        entry = ttk.Entry(body, textvariable=key_var, width=52, show="\u2022",
-                          font=t.fm(-1))
-        entry.pack(fill="x")
-        entry.focus_set()
-
-        show_var = tk.IntVar(value=0)
-
-        def toggle_show():
-            entry.configure(show="" if show_var.get() else "\u2022")
-
-        ttk.Checkbutton(body, text="Show key", variable=show_var,
-                        command=toggle_show).pack(anchor="w", pady=(px(6), 0))
-
-        self._dlg_status = ttk.Label(
-            body, style="Muted.TLabel", wraplength=px(420), justify="left",
-            text=("Current: %s (%s)" % (info["masked"], info["source_label"]))
-            if info["configured"] else "No key saved yet.")
-        self._dlg_status.pack(anchor="w", pady=(px(10), px(4)))
-
-        row = ttk.Frame(body, style="Card.TFrame")
-        row.pack(fill="x", pady=(px(8), 0))
+        self._dlg_status = ttk.Label(body, style="Muted.TLabel",
+                                     wraplength=px(460), justify="left", text="")
+        rows = ttk.Frame(body, style="Card.TFrame")
+        rows.pack(fill="x", pady=(0, px(6)))
 
         def set_status(msg: str) -> None:
             try:
@@ -395,39 +392,82 @@ class App:
             except Exception:                         # noqa: BLE001
                 pass
 
-        def do_save():
+        def do_test(key: str) -> None:
+            set_status("Testing %s\u2026" % mask(key))
+            win.update_idletasks()
+            ok, msg = test_key(self.s, key)
+            set_status(("OK - " if ok else "Failed - ") + msg)
+
+        def do_remove(key: str) -> None:
+            remove_api_key(self.s, key)
+            set_status("Removed %s." % mask(key))
+            refresh_rows()
+
+        def refresh_rows() -> None:
+            for w in rows.winfo_children():
+                w.destroy()
+            keys = list_api_keys(self.s)
+            if not keys:
+                ttk.Label(rows, text="No keys saved yet - add at least one below.",
+                          style="Muted.TLabel").pack(anchor="w")
+            for key in keys:
+                r = ttk.Frame(rows, style="Card.TFrame")
+                r.pack(fill="x", pady=(0, px(4)))
+                ttk.Label(r, text=mask(key), style="Card.TLabel",
+                          font=t.fm(-1)).pack(side="left")
+                RoundedButton(r, text="Remove", variant="danger", theme=t,
+                              command=lambda k=key: do_remove(k)).pack(side="right")
+                RoundedButton(r, text="Test", variant="secondary", theme=t,
+                              command=lambda k=key: do_test(k)).pack(
+                    side="right", padx=(0, px(6)))
+            count_label.configure(
+                text="%d key%s configured" % (len(keys), "" if len(keys) == 1 else "s"))
+            self._refresh_key_status()
+
+        count_label = ttk.Label(body, style="Field.TLabel", text="")
+        count_label.pack(anchor="w")
+        rows.pack(fill="x")
+
+        add_row = ttk.Frame(body, style="Card.TFrame")
+        add_row.pack(fill="x", pady=(px(10), 0))
+        key_var = tk.StringVar(value="")
+        entry = ttk.Entry(add_row, textvariable=key_var, width=42, show="\u2022",
+                          font=t.fm(-1))
+        entry.pack(side="left")
+        entry.focus_set()
+
+        def do_add() -> None:
             key = key_var.get().strip()
             if not key:
                 set_status("Paste a key first.")
                 return
             if not looks_like_openai_key(key):
                 set_status("That does not look like an OpenAI key "
-                           "(they start with 'sk-'). Saving anyway.")
-            where = save_api_key(self.s, key)
+                           "(they start with 'sk-'). Adding it anyway.")
+            where = add_api_key(self.s, key)
             key_var.set("")
-            set_status("Saved to %s as %s." % (where, mask(key)))
-            self._refresh_key_status()
+            set_status("Added, stored in %s." % where)
+            refresh_rows()
 
-        def do_test():
-            candidate = key_var.get().strip() or None
-            set_status("Testing...")
-            win.update_idletasks()
-            ok, msg = test_key(self.s, candidate)
-            set_status(("OK - " if ok else "Failed - ") + msg)
+        entry.bind("<Return>", lambda e: do_add())
+        RoundedButton(add_row, text="Add key", variant="primary", theme=t,
+                      command=do_add).pack(side="left", padx=(px(8), 0))
 
-        def do_remove():
-            removed = delete_api_key(self.s)
-            set_status("Removed from: %s" % (", ".join(removed) or "nothing"))
-            self._refresh_key_status()
+        show_var = tk.IntVar(value=0)
 
-        RoundedButton(row, text="Save", variant="primary", theme=t,
-                      command=do_save).pack(side="left")
-        RoundedButton(row, text="Test", variant="secondary", theme=t,
-                      command=do_test).pack(side="left", padx=(px(8), 0))
-        RoundedButton(row, text="Remove", variant="danger", theme=t,
-                      command=do_remove).pack(side="left", padx=(px(8), 0))
-        RoundedButton(row, text="Close", variant="ghost", theme=t,
+        def toggle_show():
+            entry.configure(show="" if show_var.get() else "\u2022")
+
+        ttk.Checkbutton(body, text="Show key while typing", variable=show_var,
+                        command=toggle_show).pack(anchor="w", pady=(px(6), 0))
+        self._dlg_status.pack(anchor="w", pady=(px(6), 0))
+
+        footer = ttk.Frame(body, style="Card.TFrame")
+        footer.pack(fill="x", pady=(px(10), 0))
+        RoundedButton(footer, text="Close", variant="ghost", theme=t,
                       command=win.destroy).pack(side="right")
+
+        refresh_rows()
 
     # --------------------------------------------------------- dropzone --
     def _build_dropzone(self) -> None:
@@ -486,8 +526,6 @@ class App:
         self.btn_stop = RoundedButton(btns, text="Stop", variant="danger", theme=t,
                                    command=self.stop_extract, state="disabled")
         self.btn_stop.pack(side="left", padx=px(8))
-        RoundedButton(btns, text="Retry failed", variant="secondary", theme=t,
-                   command=self.retry_failed).pack(side="left")
 
         # Row actions live HERE, in the fixed-height action card, rather than
         # in a footer under the results table. Two reasons:
@@ -495,7 +533,7 @@ class App:
         #     was the first thing Tk dropped when the window was shorter than
         #     the content - these buttons were being pushed off-screen
         #     entirely on a 1080p display;
-        #   * every other verb (Extract, Stop, Retry) is already on this row,
+        #   * every other verb (Extract, Stop, Pause) is already on this row,
         #     so this is where an operator looks for an action.
         RoundedButton(btns, text="Clear all", variant="danger", theme=t,
                    command=self.clear_all).pack(side="right")
@@ -853,32 +891,6 @@ class App:
         self.pipeline.stop()
         self.status.configure(text="Stopping… (progress is saved, you can resume later)")
 
-    def retry_failed(self) -> None:
-        ids = self.pipeline.q.failed_or_dead_ids()
-        if not ids:
-            messagebox.showinfo(APP_NAME, "No failed files to retry.")
-            return
-        if self.s.engine == "openai" and not resolve(self.s)[0]:
-            self.status.configure(text="Add an OpenAI API key to continue.")
-            self.open_api_key_dialog()
-            return
-        n = self.pipeline.q.retry_failed()
-        self.btn_extract.configure(state="disabled")
-        self.btn_stop.configure(state="normal")
-        self.btn_pause.configure(state="normal")
-        self.status.configure(text=f"Retrying {n:,} failed file(s)…")
-        threading.Thread(target=self._run_retry, args=(ids,), daemon=True).start()
-
-    def _run_retry(self, ids: List[int]) -> None:
-        try:
-            self.pipeline.start(scope_ids=ids)
-            self.pipeline.join()
-            self._enqueue_log("Retry finished.")
-        except Exception as e:                        # noqa: BLE001
-            self._enqueue_log(f"FATAL: {e}")
-        finally:
-            self.ui_queue.put(("finished", None))
-
     # ------------------------------------------------------ ui updates --
     def _enqueue_row(self, row: Dict) -> None:
         self.ui_queue.put(("row", row))
@@ -962,12 +974,18 @@ class App:
         self.badge.configure(text=f"{self.row_count:,} record(s)")
 
     def _update_progress(self, st: Stats) -> None:
+        # st.failed feeds the ETA maths (see Stats.eta_seconds) but is
+        # deliberately not shown here - the multi-key pool already retries a
+        # rate-limited/quota-exhausted key against every other configured
+        # key before a file can even reach that counter, so surfacing it
+        # would just be a "retry failed"-flavoured message with nothing
+        # actionable behind it.
         total = max(1, st.total)
         pct = 100.0 * (st.done + st.failed) / total
         self.progress.configure(value=min(100.0, pct))
         self.status.configure(
             text=(f"{st.done:,}/{st.total:,} files · {st.rows:,} rows · "
-                  f"{st.failed:,} failed · {st.rate:.1f} files/s · "
+                  f"{st.rate:.1f} files/s · "
                   f"ETA {human_eta(st.eta_seconds)} · CSV → {self.s.csv_dir}"))
 
     def _restore_counts(self) -> None:
