@@ -530,15 +530,6 @@ class App:
         self.btn_stop = RoundedButton(btns, text="Stop", variant="danger", theme=t,
                                    command=self.stop_extract, state="disabled")
         self.btn_stop.pack(side="left", padx=px(8))
-        # Green, like every other one-shot "produce an output file" action -
-        # see theme.py's colour system. The sharded CSVs already have
-        # working hyperlinks (they open the scan when clicked), but a plain
-        # .csv cannot make that link LOOK like a hyperlink (blue,
-        # underlined) - there is no cell styling in CSV at all. This is the
-        # one place that gets the real thing, in one polished file.
-        RoundedButton(btns, text="Download Excel", variant="success", theme=t,
-                   command=self.download_excel).pack(side="left")
-
         # Row actions live HERE, in the fixed-height action card, rather than
         # in a footer under the results table. Two reasons:
         #   * the results card expands, and anything packed after the table
@@ -556,13 +547,8 @@ class App:
 
         self.sel_label = ttk.Label(btns, text="Nothing selected", style="Muted.TLabel")
         self.sel_label.pack(side="right", padx=(0, px(16)), pady=(px(6), 0))
-
-        # Open the scan behind the highlighted row, so the extracted values
-        # can be checked against the actual certificate without hunting for
-        # the file. Also wired to double-click on a row.
-        RoundedButton(btns, text="Open", variant="secondary", theme=t,
-                   command=self.open_selected_source).pack(
-            side="right", padx=(0, px(10)))
+        # The "Open" button was removed by request; double-clicking a row still
+        # opens the scan behind it (see _open_source_file).
 
     # ---------------------------------------------------------- results --
     def _build_results(self) -> None:
