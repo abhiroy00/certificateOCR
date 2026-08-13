@@ -66,20 +66,20 @@ ADDON_FIELDS: List[str] = [
 # queue.db, and "Delete selected" matches CSV rows on Source File +
 # CertificateNo instead (see csv_writer.remove_rows).
 CSV_SPEC = [
+    ("File name", "@source_file"),
     ("Review", "@review"),
-    ("Source File", "@source_file"),
-    ("Script Name", "company_name"),
+    ("Script name", "company_name"),
     ("Script_type", "share_type"),
     ("Initial Folio No", "folio_no"),
     ("Initial Folio No_2", "registered_folio_no"),
     ("CertificateNo", "certificate_no"),
     ("First Share Holder Name", "share_holder_name"),
-    ("Present Share Holder Name", "latest_share_holder_name"),
     ("No of Shares", "no_of_shares"),
     ("Face Value Per Share", "face_value_per_share"),
     ("From Distinctive No", "distinctive_from"),
     ("To Distinctive No.", "distinctive_to"),
     ("Date of Issue", "date_of_issue"),
+    ("Present Share Holder Name", "latest_share_holder_name"),
     ("Present Transfer Date", "latest_issue_date"),
     ("Present Folio No", "latest_folio_no"),
     ("Remarks", "remarks"),
@@ -98,6 +98,16 @@ _SPECIAL_TO_KEY = {"@review": "review", "@source_file": "source_file",
                    "@extracted_at": "extracted_at"}
 HEADER_TO_KEY = {
     header: _SPECIAL_TO_KEY.get(src, src) for header, src in CSV_SPEC
+}
+
+# Pretty headers used by EARLIER builds, mapped to their internal key. When a
+# header is renamed (e.g. "Source File" -> "File name", "Script Name" ->
+# "Script name"), a shard written under the old name still migrates cleanly
+# because csv_writer._migrate_row matches columns by meaning, not by the exact
+# old text. Add the previous header here whenever one is renamed.
+CSV_HEADER_ALIASES = {
+    "Source File": "source_file",
+    "Script Name": "company_name",
 }
 
 # Columns used to identify a row for "Delete selected" now that row_id is not

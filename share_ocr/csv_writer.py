@@ -14,8 +14,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, List, Optional
 
-from .config import (CERT_NO_HEADER, CSV_COLUMNS, CSV_SPEC,
-                     SOURCE_FILE_HEADER, review_verdict)
+from .config import (CERT_NO_HEADER, CSV_COLUMNS, CSV_HEADER_ALIASES,
+                     CSV_SPEC, HEADER_TO_KEY, SOURCE_FILE_HEADER,
+                     review_verdict)
 
 # ------------------------------------------------------ Source File links --
 # The "Source File" column is written as an Excel HYPERLINK() formula rather
@@ -147,29 +148,25 @@ class ShardedCsvWriter:
     @staticmethod
     def _migrate_row(old: Dict) -> Dict:
         """Map one row read from an older-format shard onto the current
-        CSV_SPEC. `old` may be keyed by the previous internal snake_case
-        names (e.g. company_name) OR by an earlier set of pretty headers
-        (e.g. Script Name) - we pull from whichever is present, so this is
-        both a snake->pretty migration and an idempotent no-op once a file
-        is already current. New columns (Review, Present Transfer Date) that
-        old data never had are derived or left blank."""
-        def pick(*keys):
-            for k in keys:
-                v = old.get(k)
-                if v not in (None, ""):
-                    return v
-            return ""
+        CSV_SPEC. `old` may be keyed by internal snake_case names
+        (company_name), the current pretty headers, or a PREVIOUS set of
+        pretty headers from before a column was renamed/reordered (e.g.
+        "Source File" now "File name"). Every key is first resolved to its
+        internal meaning, so this is a rename/reorder/snake->pretty migration
+        and an idempotent no-op once a file is already current. New columns
+        (Review, Present Transfer Date) old data never had are derived or
+        left blank."""
+        by_key: Dict[str, str] = {}
+        for k, v in old.items():
+            internal = HEADER_TO_KEY.get(k) or CSV_HEADER_ALIASES.get(k) or k
+            if v not in (None, "") and not by_key.get(internal):
+                by_key[internal] = v
         row = {}
         for header, src in CSV_SPEC:
             if src == "@review":
-                row[header] = review_verdict(
-                    pick("validation_flags", "Validation Flags"))
-            elif src == "@source_file":
-                row[header] = pick("source_file", header)
-            elif src == "@extracted_at":
-                row[header] = pick("extracted_at", header)
+                row[header] = review_verdict(by_key.get("validation_flags", ""))
             else:
-                row[header] = pick(src, header)   # internal snake OR pretty
+                row[header] = by_key.get(HEADER_TO_KEY[header], "")
         return row
 
     @staticmethod
