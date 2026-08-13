@@ -260,7 +260,12 @@ class KeyPool:
     def order(self) -> List[str]:
         """Keys to try for one request, starting from the next round-robin
         slot, healthy keys before ones still cooling down from a recent
-        rate-limit/quota error."""
+        rate-limit/quota error.
+
+        Side-effecting: every call advances the round-robin pointer, so this
+        is meant to be called exactly once per request (as _complete() does).
+        Calling it an extra time - e.g. to log or inspect the order - skews
+        which key the next real request starts from."""
         with self._lock:
             if not self.keys:
                 return []

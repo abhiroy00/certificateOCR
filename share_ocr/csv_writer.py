@@ -51,18 +51,26 @@ def hyperlink_cell(path: Optional[str], display: str) -> str:
     return '=HYPERLINK("%s","%s")' % (esc(path), esc(display))
 
 
+def parse_hyperlink_cell(value: str):
+    """(path, display) out of a Source File cell. `path` is None when the
+    cell is plain text - shards written before this feature, or a value
+    that isn't a recognised HYPERLINK() formula at all - in which case
+    `display` is just the value itself."""
+    if not value:
+        return None, value
+    m = _HYPERLINK_RE.match(value.strip())
+    if not m:
+        return None, value
+    return m.group(1).replace('""', '"'), m.group(2).replace('""', '"')
+
+
 def display_name(value: str) -> str:
     """The plain file name behind a Source File cell, whether it holds a
     HYPERLINK() formula (current shards) or plain text (shards written
     before this feature, or a value that isn't a recognised formula at
     all). Used anywhere a row needs to be matched by file name rather than
     by its raw cell text - see remove_rows()/_rewrite_without()."""
-    if not value:
-        return value
-    m = _HYPERLINK_RE.match(value.strip())
-    if not m:
-        return value
-    return m.group(2).replace('""', '"')
+    return parse_hyperlink_cell(value)[1]
 
 
 class ShardedCsvWriter:
@@ -248,6 +256,58 @@ class ShardedCsvWriter:
                         wrote_header = True
                     for line in f:
                         out.write(line)
+        return dest
+
+    # ------------------------------------------------------------------
+    def merge_into_excel(self, dest: Path) -> Path:
+        """Merge every shard into one real .xlsx workbook, with Source File
+        as a genuine Excel hyperlink - blue and underlined - instead of a
+        =HYPERLINK() formula.
+
+        Why this exists: plain CSV cannot carry cell styling at all. A
+        =HYPERLINK() formula in a .csv still opens the scan when clicked -
+        Excel evaluates it as a formula the moment the cell's content
+        starts with "=" - but Excel does not auto-apply the blue/underlined
+        "Hyperlink" look to a formula result, only to a real hyperlink
+        object (or a URL typed directly into a cell). There is no way
+        around that while the file stays a .csv.
+
+        The sharded .csv files remain the primary, scalable output - this
+        is a one-shot bulk write, only sane up to roughly the same ~1M-row
+        ceiling as merge_into(), for when a client wants one polished file
+        to open and click through rather than raw shards.
+        """
+        try:
+            from openpyxl import Workbook
+            from openpyxl.styles import Font
+        except ImportError as e:
+            raise RuntimeError(
+                "Excel export needs the openpyxl package. Run:\n"
+                "    pip install openpyxl") from e
+
+        self.flush()
+        dest = Path(dest)
+        wb = Workbook()
+        ws = wb.active
+        ws.title = "certificates"
+        ws.append(CSV_COLUMNS)
+        for cell in ws[1]:
+            cell.font = Font(bold=True)
+
+        link_col = CSV_COLUMNS.index(SOURCE_FILE_HEADER) + 1  # openpyxl is 1-based
+        for p in sorted(self.out_dir.glob(f"{self.prefix}-part-*.csv")):
+            with p.open("r", encoding="utf-8-sig", newline="") as f:
+                for old in csv.DictReader(f):
+                    row = self._migrate_row(old)
+                    ws.append([row.get(h, "") for h in CSV_COLUMNS])
+                    cell = ws.cell(row=ws.max_row, column=link_col)
+                    link_path, display = parse_hyperlink_cell(cell.value)
+                    cell.value = display
+                    if link_path:
+                        cell.hyperlink = link_path
+                        cell.style = "Hyperlink"   # the real blue+underline look
+
+        wb.save(dest)
         return dest
 
 

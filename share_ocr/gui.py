@@ -530,6 +530,14 @@ class App:
         self.btn_stop = RoundedButton(btns, text="Stop", variant="danger", theme=t,
                                    command=self.stop_extract, state="disabled")
         self.btn_stop.pack(side="left", padx=px(8))
+        # Green, like every other one-shot "produce an output file" action -
+        # see theme.py's colour system. The sharded CSVs already have
+        # working hyperlinks (they open the scan when clicked), but a plain
+        # .csv cannot make that link LOOK like a hyperlink (blue,
+        # underlined) - there is no cell styling in CSV at all. This is the
+        # one place that gets the real thing, in one polished file.
+        RoundedButton(btns, text="Download Excel", variant="success", theme=t,
+                   command=self.download_excel).pack(side="left")
 
         # Row actions live HERE, in the fixed-height action card, rather than
         # in a footer under the results table. Two reasons:
@@ -1033,6 +1041,13 @@ class App:
             self.row_count = shown
             self._insert_row(rec)
             shown = self.row_count
+        # recent_rows() is capped at 400 for table-preview performance, but
+        # the badge must reflect the TRUE total extracted so far - a bulk
+        # run can have far more than 400 rows. Re-query it rather than
+        # trusting `shown`, which would otherwise silently cap the badge at
+        # 400 forever after the first reload (e.g. every app restart).
+        self.row_count = self.pipeline.q.counts().get("rows", shown)
+        self.badge.configure(text=f"{self.row_count:,} record(s)")
 
     def _reload_failed(self) -> None:
         """Populate the table with files that errored out during extraction
@@ -1068,6 +1083,24 @@ class App:
             return
         try:
             out = self.pipeline.export_single_csv(dest)
+            messagebox.showinfo(APP_NAME, f"Saved:\n{out}")
+        except Exception as e:                        # noqa: BLE001
+            messagebox.showerror(APP_NAME, str(e))
+
+    def download_excel(self) -> None:
+        """One polished .xlsx with real (blue, underlined) Source File
+        links - a plain .csv cannot carry that at all, since it has no
+        concept of cell styling; Excel only auto-applies the hyperlink
+        look to a real hyperlink object, never to a =HYPERLINK() formula
+        result. See csv_writer.ShardedCsvWriter.merge_into_excel."""
+        dest = filedialog.asksaveasfilename(
+            title="Save as Excel", defaultextension=".xlsx",
+            initialfile="certificates.xlsx",
+            filetypes=[("Excel workbook", "*.xlsx")])
+        if not dest:
+            return
+        try:
+            out = self.pipeline.export_excel(dest)
             messagebox.showinfo(APP_NAME, f"Saved:\n{out}")
         except Exception as e:                        # noqa: BLE001
             messagebox.showerror(APP_NAME, str(e))

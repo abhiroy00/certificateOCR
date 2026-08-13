@@ -147,6 +147,15 @@ Ends the run. Everything already read is saved. You can close the app
 entirely and press **Extract** again later - it picks up where it left off
 and does not re-read or re-charge for files already done.
 
+### Download Excel
+Writes everything extracted so far to one `.xlsx` file wherever you choose.
+Safe to use mid-run. This is the one place the File Name column looks like a
+real hyperlink - blue and underlined - because a genuine Excel file can carry
+that styling and a plain `.csv` cannot (see the note under "The table" in
+section 4). The working output stays the sharded `.csv` files in the output
+folder; this button is for handing someone a single polished file. Needs the
+`openpyxl` package - the button tells you if it's missing.
+
 ### There is no "Retry failed" button
 There does not need to be one. A rate limit or a dropped connection on one
 key automatically moves that request to the next key in your pool (see
@@ -209,7 +218,11 @@ hunting for the file.
 
 **The exported CSV works the same way in Excel.** The File Name column in
 the CSV is a live link - click it and Excel opens the exact scan that row
-came from, the same as double-clicking the row here.
+came from, the same as double-clicking the row here. It will not look blue
+or underlined in the .csv itself - a plain .csv file cannot carry colour at
+all, only the *action* of the link. For a file where it actually looks like
+a normal blue hyperlink, use **Download Excel** (bottom of the window) -
+that writes a real one-off .xlsx with proper hyperlink styling.
 
 ### The thumbnails
 A quick visual check that the right images are being processed - useful for

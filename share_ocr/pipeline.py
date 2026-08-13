@@ -341,6 +341,12 @@ class Pipeline:
     def export_single_csv(self, dest: str) -> str:
         return str(self.csv.merge_into(Path(dest)))
 
+    def export_excel(self, dest: str) -> str:
+        """One polished .xlsx with real (blue, underlined) hyperlinks - see
+        csv_writer.ShardedCsvWriter.merge_into_excel for why this can't be
+        done in a plain .csv."""
+        return str(self.csv.merge_into_excel(Path(dest)))
+
     def delete_rows(self, row_ids: List[int], requeue: bool = True) -> int:
         """Remove specific extracted rows: DB, CSV shards, and (by default)
         put the source file back to pending so Extract can redo it."""

@@ -99,6 +99,17 @@ image/PDF directly, no hunting through folders. See
 programmatically (e.g. `tools/check_accuracy.py`) call `display_name()` to
 get the plain file name back out of that cell.
 
+**Why the link isn't blue in the .csv.** CSV has no concept of cell styling
+at all, so there is no way to make that formula's text render the way a
+"real" hyperlink looks (blue, underlined) while the file stays a .csv - it
+opens the scan when clicked either way, it just looks like plain text until
+then. For a single polished file with genuine hyperlink styling, use
+**Download Excel** in the GUI or `python -m share_ocr.cli export-xlsx
+out.xlsx` (needs `pip install openpyxl`) - see
+`csv_writer.ShardedCsvWriter.merge_into_excel`. The sharded `.csv` files stay
+the primary, scalable output; the `.xlsx` is a one-shot merge for handing to
+someone who wants to open one nice-looking file.
+
 ### Billed add-on fields (#10, #11, #12)
 
 These three are optional add-ons in the quotation, so they get extra handling —

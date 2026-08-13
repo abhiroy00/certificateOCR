@@ -65,10 +65,14 @@ def main() -> int:
     # machine's CPU shipped to a client machine that may not support the
     # same instruction set - a classic silent "has stopped working" crash
     # with no Python traceback. None of these are ever imported by this
-    # app's own code, so excluding them is safe.
+    # app's own code, so excluding them is safe. openpyxl is deliberately
+    # NOT in this list any more - the GUI's "Download Excel" button
+    # (csv_writer.merge_into_excel) imports it for real now, so excluding
+    # it would make that button silently break in the shipped exe.
     for mod in ("numpy", "pandas", "numba", "llvmlite", "sqlalchemy",
-                "psycopg2", "opentelemetry", "openpyxl"):
+                "psycopg2", "opentelemetry"):
         cmd += ["--exclude-module", mod]
+    cmd += ["--hidden-import", "openpyxl"]
     if ICON.exists():
         cmd += ["--icon", str(ICON),
                 "--add-data", "%s%s%s" % (ICON, ";" if sys.platform == "win32" else ":", "assets")]

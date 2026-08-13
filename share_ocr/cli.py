@@ -121,6 +121,18 @@ def cmd_export(args) -> int:
     return 0
 
 
+def cmd_export_excel(args) -> int:
+    s = build_settings(args)
+    p = Pipeline(s)
+    # A plain .csv cannot carry cell styling (no such thing in the CSV
+    # format), so Source File there is a working =HYPERLINK() formula that
+    # opens the scan but never LOOKS like a hyperlink. This produces a real
+    # .xlsx with a genuine blue/underlined hyperlink object instead - see
+    # csv_writer.ShardedCsvWriter.merge_into_excel.
+    print("Merged ->", p.export_excel(args.dest))
+    return 0
+
+
 def main(argv=None) -> int:
     logging.basicConfig(level=logging.INFO,
                         format="%(asctime)s %(levelname)s %(message)s")
@@ -152,6 +164,12 @@ def main(argv=None) -> int:
     sp = sub.add_parser("export", help="merge CSV shards into one file")
     sp.add_argument("dest")
     sp.set_defaults(func=cmd_export)
+
+    sp = sub.add_parser("export-xlsx",
+                        help="merge into one .xlsx with real (blue, "
+                             "underlined) hyperlinks - needs openpyxl")
+    sp.add_argument("dest")
+    sp.set_defaults(func=cmd_export_excel)
 
     args = ap.parse_args(argv)
     return args.func(args)
