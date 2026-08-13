@@ -64,10 +64,9 @@ queue.db-wal
 queue.db-shm
 *.log
 
-# Sharded CSV output + the needs-review sidecar. Named precisely rather than
-# ignoring *.csv, so a genuine fixture CSV can still be committed.
+# Sharded CSV output. Named precisely rather than ignoring *.csv, so a
+# genuine fixture CSV can still be committed.
 certificates-part-*.csv
-certificates-needs-review.csv
 certificates.csv
 
 # Preview thumbnails cache

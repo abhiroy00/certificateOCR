@@ -134,6 +134,10 @@ class App:
         self._sel_token = 0          # discards stale background file counts
         self.row_count = 0
         self._thumb_imgs: List[tk.PhotoImage] = []
+        # iid -> source path for rows in the "Failed" filter, which are not
+        # backed by a results row_id the way extracted rows are - see
+        # _reload_failed() / _row_source_path().
+        self._failed_paths: Dict[str, str] = {}
 
         # Fonts + ttk styles first: every widget below reads self.t for sizes.
         self.t = apply_theme(root)
@@ -568,10 +572,13 @@ class App:
                               bd=0)
         self.badge.pack(side="left", padx=px(10))
 
-        # Only "All" is shown; the "Needs review" filter was removed by
-        # request. filter_var stays so the row-filtering code paths keep a
-        # valid value to read (it is always "all" now).
+        # "All" (extracted rows) and "Failed" (files that errored out during
+        # extraction - see _reload_failed()). Packed in this order because
+        # side="right" stacks right-to-left, so this reads "All  Failed"
+        # left-to-right.
         self.filter_var = tk.StringVar(value="all")
+        ttk.Radiobutton(head, text="Failed", value="failed", variable=self.filter_var,
+                        command=self._reload_table).pack(side="right", padx=px(12))
         ttk.Radiobutton(head, text="All", value="all", variable=self.filter_var,
                         command=self._reload_table).pack(side="right", padx=px(12))
 
@@ -932,15 +939,21 @@ class App:
                 self.btn_extract.configure(state="normal")
                 self.btn_stop.configure(state="disabled")
                 self.btn_pause.configure(state="disabled", text="Pause")
+                if self.filter_var.get() == "failed":
+                    self._reload_table()
         if not self._closing:
             self._after_id = self.root.after(150, self._drain_ui_queue)
 
     def _insert_row(self, row: Dict) -> None:
-        if self.filter_var.get() == "review" and not row.get("validation_flags"):
-            self.row_count += 1
-            self.badge.configure(text=f"{self.row_count:,} records")
-            return
         self.row_count += 1
+        if self.filter_var.get() != "all":
+            # A live successful extraction arrived while the operator is
+            # looking at the "Failed" tab. Don't leak it into that list or
+            # stomp its badge with this row's "N record(s)" text - row_count
+            # still advances so the running total is correct the moment
+            # they switch back to "All" (which also fully reloads from the
+            # DB regardless, so nothing is lost either way).
+            return
         dist = ""
         if row.get("distinctive_from") or row.get("distinctive_to"):
             dist = f"{row.get('distinctive_from','')} - {row.get('distinctive_to','')}"
@@ -974,17 +987,21 @@ class App:
         self.badge.configure(text=f"{self.row_count:,} record(s)")
 
     def _update_progress(self, st: Stats) -> None:
-        # st.failed feeds the ETA maths (see Stats.eta_seconds) but is
-        # deliberately not shown here - the multi-key pool already retries a
-        # rate-limited/quota-exhausted key against every other configured
-        # key before a file can even reach that counter, so surfacing it
-        # would just be a "retry failed"-flavoured message with nothing
-        # actionable behind it.
+        # st.failed only counts a file once it is permanently dead (every
+        # retry, across every configured API key, exhausted - see
+        # extractor.KeyPool and pipeline._process_one), so it is a small,
+        # meaningful number rather than per-attempt noise - worth showing.
+        # What stays suppressed is the scary PER-FILE "ERROR ..." message
+        # (routed to share_ocr.log only); this is just the running total,
+        # and the "Failed" tab (see _reload_failed) lists which files.
         total = max(1, st.total)
         pct = 100.0 * (st.done + st.failed) / total
         self.progress.configure(value=min(100.0, pct))
+        done_part = f"{st.done:,}/{st.total:,} done"
+        if st.failed:
+            done_part += f" · {st.failed:,} failed"
         self.status.configure(
-            text=(f"{st.done:,}/{st.total:,} files · {st.rows:,} rows · "
+            text=(f"{done_part} · {st.rows:,} rows · "
                   f"{st.rate:.1f} files/s · "
                   f"ETA {human_eta(st.eta_seconds)} · CSV → {self.s.csv_dir}"))
 
@@ -1001,19 +1018,46 @@ class App:
 
     def _reload_table(self) -> None:
         self.tree.delete(*self.tree.get_children())
+        self._failed_paths.clear()
+        if self.filter_var.get() == "failed":
+            self._reload_failed()
+            return
         import json
         rows = self.pipeline.q.recent_rows(400)
         shown = 0
         for r in reversed(rows):
             rec = json.loads(r["payload"])
-            if self.filter_var.get() == "review" and not r["flags"]:
-                continue
             rec["source_file"] = r["name"]
             rec["validation_flags"] = r["flags"]
             rec["row_id"] = r["row_id"]
             self.row_count = shown
             self._insert_row(rec)
             shown = self.row_count
+
+    def _reload_failed(self) -> None:
+        """Populate the table with files that errored out during extraction
+        (queue status 'failed' - will auto-retry on the next Extract - or
+        'dead' - gave up after max_attempts). This is a read-only look at
+        what could not be read; there is deliberately no retry action here,
+        since the multi-key pool (extractor.KeyPool) already tries every
+        configured key before a file can end up in this list at all, so
+        what's left is either a genuinely bad scan or a run still in
+        progress. Only the File and Flags columns apply to a failed file -
+        everything else is blank."""
+        fails = self.pipeline.q.failures(400)
+        for i, r in enumerate(fails, start=1):
+            iid = f"f{r['id']}"
+            self._failed_paths[iid] = r["path"]
+            detail = f"{r['error']}  (attempt {r['attempts']}/{self.s.max_attempts})"
+            values = [""] * len(COLUMNS)
+            values[0] = i
+            values[1] = r["name"]
+            values[-1] = detail
+            if not self.tree.exists(iid):
+                self.tree.insert("", "end", iid=iid, values=values,
+                                 tags=("flagged",))
+        self.badge.configure(
+            text=f"{len(fails):,} failed file" + ("" if len(fails) == 1 else "s"))
 
     # ---------------------------------------------------------- output --
     def download_csv(self) -> None:
@@ -1095,10 +1139,15 @@ class App:
     def _row_source_path(self, iid) -> Optional[str]:
         """Absolute path of the scan behind a table row.
 
-        The row iid IS the database row_id, which is the only reliable link:
-        the visible "File" column holds just the base name, and several
-        folders in a 30-lakh run will contain the same name.
+        For an extracted row, iid IS the database row_id, which is the only
+        reliable link: the visible "File" column holds just the base name,
+        and several folders in a 30-lakh run will contain the same name.
+        For a "Failed" row, iid is "f<file_id>" instead (there is no results
+        row_id to key off since extraction never succeeded), so its path
+        comes from the cache _reload_failed() fills in.
         """
+        if iid in self._failed_paths:
+            return self._failed_paths[iid]
         try:
             row_id = int(iid)
         except (TypeError, ValueError):
@@ -1138,6 +1187,17 @@ class App:
         sel = self.tree.selection()
         if not sel:
             messagebox.showinfo(APP_NAME, "Select one or more rows first.")
+            return
+        if self.filter_var.get() == "failed":
+            # A failed file never produced an extracted row, so there is
+            # nothing in the CSV/results table to delete here - it just
+            # needs a real fix (or simply leaving alone: it auto-retries on
+            # the next Extract unless it's already 'dead').
+            messagebox.showinfo(
+                APP_NAME, "Failed files have no extracted row to delete. "
+                          "Switch to 'All' to delete extracted rows, or "
+                          "just press Extract again - anything not yet "
+                          "given up on retries automatically.")
             return
         row_ids: List[int] = []
         for iid in sel:

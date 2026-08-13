@@ -2,8 +2,14 @@
 
 Never holds more than `flush_rows` records in memory, so it can write
 30 lakh rows without touching pandas. Rows are appended to part files
-(part-00001.csv, part-00002.csv ...) so no single CSV becomes unusable,
-and a `_needs_review.csv` sidecar collects every flagged row.
+(part-00001.csv, part-00002.csv ...) so no single CSV becomes unusable.
+
+There used to be a second `certificates-needs-review.csv` sidecar collecting
+every flagged row. It is gone: the Review column already says "Yes"/"No" on
+every row of the main CSV, so filtering on that column in Excel does the same
+job without a second file that can drift out of sync with the first. Files
+that failed extraction entirely now show up here too (see failed_file_row) -
+one file, one CSV, everything in it.
 """
 from __future__ import annotations
 
@@ -15,7 +21,8 @@ from pathlib import Path
 from typing import Dict, List, Optional
 
 from .config import (CERT_NO_HEADER, CSV_COLUMNS, CSV_HEADER_ALIASES,
-                     CSV_SPEC, HEADER_TO_KEY, SOURCE_FILE_HEADER,
+                     CSV_SPEC, EXTRACTED_AT_HEADER, FLAGS_HEADER,
+                     HEADER_TO_KEY, REVIEW_HEADER, SOURCE_FILE_HEADER,
                      review_verdict)
 
 # ------------------------------------------------------ Source File links --
@@ -68,7 +75,6 @@ class ShardedCsvWriter:
         self.prefix = prefix
         self._lock = threading.Lock()
         self._buf: List[Dict] = []
-        self._review_buf: List[Dict] = []
         self._shard_index = self._detect_shard_index()
         self._rows_in_shard = self._count_rows(self._shard_path())
         self.total_written = 0
@@ -81,9 +87,6 @@ class ShardedCsvWriter:
     def _shard_path(self) -> Path:
         return self.out_dir / f"{self.prefix}-part-{self._shard_index:05d}.csv"
 
-    def _review_path(self) -> Path:
-        return self.out_dir / f"{self.prefix}-needs-review.csv"
-
     @staticmethod
     def _count_rows(path: Path) -> int:
         if not path.exists():
@@ -95,12 +98,6 @@ class ShardedCsvWriter:
     def write(self, row: Dict) -> None:
         with self._lock:
             self._buf.append(row)
-            # rows are keyed by CSV header; "Review" is "Yes" exactly when the
-            # The needs-review sidecar collects every row that carries ANY
-            # validation flag (soft advisories included), even though the
-            # Review column only says "Yes" for the hard ones.
-            if row.get("Validation Flags"):
-                self._review_buf.append(row)
             if len(self._buf) >= self.flush_rows:
                 self._flush_locked()
 
@@ -128,9 +125,6 @@ class ShardedCsvWriter:
             if self._rows_in_shard >= self.shard_rows:
                 self._shard_index += 1
                 self._rows_in_shard = 0
-        if self._review_buf:
-            self._append(self._review_path(), self._review_buf)
-            self._review_buf.clear()
 
     @staticmethod
     def _append(path: Path, rows: List[Dict]) -> None:
@@ -195,7 +189,7 @@ class ShardedCsvWriter:
     # ------------------------------------------------------------------
     def remove_rows(self, signatures) -> int:
         """Physically drop rows matching these (source_file, certificate_no)
-        signatures from every shard and the needs-review sidecar.
+        signatures from every shard.
 
         This is the GUI's interactive "Delete selected" action. row_id is no
         longer exported (the client deliverable doesn't carry it), so rows
@@ -210,8 +204,7 @@ class ShardedCsvWriter:
         with self._lock:
             self._flush_locked()
             removed = 0
-            for path in [*sorted(self.out_dir.glob(f"{self.prefix}-part-*.csv")),
-                         self._review_path()]:
+            for path in sorted(self.out_dir.glob(f"{self.prefix}-part-*.csv")):
                 removed += self._rewrite_without(path, sigset)
             self._rows_in_shard = self._count_rows(self._shard_path())
             return removed
@@ -277,4 +270,23 @@ def record_to_row(rec: Dict, *, name: str, source_path: Optional[str] = None) ->
         else:
             v = rec.get(src)
             row[header] = "" if v is None else v
+    return row
+
+
+def failed_file_row(name: str, source_path: Optional[str], error: str) -> Dict:
+    """A CSV row for a file that never produced an extraction at all (queue
+    status 'dead' - every retry, across every configured API key, was
+    exhausted - see pipeline._process_one). Every data column is left blank
+    on purpose: there is nothing to show for a file that was never actually
+    read, only that it needs a human look. Source File still links to the
+    scan so that look is one click away.
+
+    This is what replaced the separate needs-review sidecar file: flagged
+    rows (successful-but-uncertain, and now fully-failed ones too) all live
+    in the one CSV, distinguished by the Review column."""
+    row = {header: "" for header in CSV_COLUMNS}
+    row[SOURCE_FILE_HEADER] = hyperlink_cell(source_path, name)
+    row[REVIEW_HEADER] = "Yes"
+    row[FLAGS_HEADER] = "Extraction failed: " + " ".join(str(error).split())
+    row[EXTRACTED_AT_HEADER] = datetime.now(timezone.utc).isoformat(timespec="seconds")
     return row

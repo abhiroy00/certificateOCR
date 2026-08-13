@@ -153,7 +153,11 @@ key automatically moves that request to the next key in your pool (see
 section 2) - the file still gets read on the same pass. A file that
 genuinely cannot be read (a corrupt scan) is simply left out of the results;
 pressing **Extract** again later still picks up anything left pending
-without re-reading or re-charging for files already done.
+without re-reading or re-charging for files already done. If you want to
+see which files those were, switch to the **Failed** tab in Results
+(section 4) - it is a read-only list, there is nothing to click to retry it,
+because there is nothing a retry would do that the next **Extract** press
+does not already do on its own.
 
 ### "Nothing selected" / "1,240 files selected"
 Just tells you what **Extract** is about to work on.
@@ -165,14 +169,28 @@ Just tells you what **Extract** is about to work on.
 ### The records badge
 How many rows have been extracted so far in this session.
 
-### Needs review / All
-The important switch.
+### All / Failed
+* **All** - every row that was successfully extracted. This is the normal
+  view; rows the validator is not confident about are tinted amber or blue
+  right in this list (see the flag table below) rather than hidden behind a
+  separate filter.
+* **Failed** - not extracted rows at all, but the files that errored out and
+  never produced one. Shows the file name and the error, so you can see
+  which scans need a human look (usually a corrupt or unreadable file - a
+  rate limit or dropped connection does not end up here, since the key pool
+  already moves that request to another key automatically). Double-click or
+  **Open** still opens the original scan from this tab; **Delete selected**
+  does not apply here since there is no extracted row to delete - just press
+  **Extract** again to have another go at anything still pending.
 
-* **All** - every row.
-* **Needs review** - only rows the validator is not confident about. This is
-  your work queue. At scale you never check every row; you check these.
+A file that gives up for good (no more automatic retries left) also gets a
+row in the CSV itself - File name linked to the scan, Review marked "Yes",
+the error in Validation Flags, every other column blank. That way a file
+that could never be read still shows up when you open the CSV in Excel, not
+just here in the app.
 
-A row lands in **Needs review** when something does not add up:
+In the **All** tab, a row is tinted amber or blue (see the legend above the
+table) when something does not add up:
 
 | Flag | What it means | Usual fix |
 |---|---|---|
@@ -209,8 +227,9 @@ and the rupee symbol do not turn into junk characters.
 ### Open CSV folder
 Opens the working folder that holds the automatically written CSV parts. For
 very large jobs the output is split into files of 200,000 rows so Excel can
-actually open them, plus a separate `certificates-needs-review.csv`
-containing only the flagged rows.
+actually open them. There is one CSV per part - no separate needs-review
+file - flagged rows (including files that failed extraction entirely) are
+right there in the same file, marked "Yes" in the Review column.
 
 ### Clear all
 Empties the queue, the results table and the working database. It does not

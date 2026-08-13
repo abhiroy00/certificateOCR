@@ -39,7 +39,8 @@ python run_gui.py
 * **Extract** → rows appear live in the table, CSV is written as it goes
 * **Pause / Stop** anytime — progress is saved, press Extract again to resume
 * **Download CSV** merges all shards into one file; **Clear All** wipes the queue
-* Flagged rows are highlighted and also written to `certificates-needs-review.csv`
+* Flagged rows are highlighted right in the table (and the Review column) - there
+  is no separate needs-review file to keep in sync with the main one
 
 ## 3. Run headless for the big job
 
@@ -70,9 +71,17 @@ atomic, so no image is processed twice.
   queue.db                              # resumable job queue + all results
   csv/certificates-part-00001.csv       # 200k rows per shard
   csv/certificates-part-00002.csv
-  csv/certificates-needs-review.csv     # only flagged rows
   share_ocr.log
 ```
+
+One CSV, not two. Flagged rows (soft advisories, hard validation failures,
+and files that failed extraction entirely) all live in the same shards as
+everything else, distinguished by the Review column - filter on that in
+Excel instead of hunting through a second file. A file that never produced
+an extraction at all (every retry across every configured key exhausted -
+see `csv_writer.failed_file_row`) still gets a row: Source File links to the
+scan, Review is "Yes", Validation Flags says why, every other column is
+blank.
 
 Columns: `row_id, source_file, source_path, page_no, company_name, share_type,
 folio_no, registered_folio_no, certificate_no, share_holder_name,
@@ -102,10 +111,10 @@ they are extracted, shown in the GUI table, and audited:
 | 12 | Registered Folio No. | `registered_folio_no` | Read from the separate `Regd. Folio No.` box. If the certificate prints only one folio number anywhere, the same value fills both `folio_no` and `registered_folio_no`. |
 
 **Audit flag.** Because the client is paying for these, a row whose add-on came
-back empty is flagged `Add-on not captured: <field names>` and lands in
-`certificates-needs-review.csv`. In the GUI those rows are tinted **blue**
-(add-on gap only) versus **amber** (a core field actually failed validation),
-so you can tell a billing gap from a bad scan at a glance.
+back empty is flagged `Add-on not captured: <field names>` right in the main
+CSV. In the GUI those rows are tinted **blue** (add-on gap only) versus
+**amber** (a core field actually failed validation), so you can tell a
+billing gap from a bad scan at a glance.
 
 There is also a guard against the classic mix-up: if `face_value_per_share`
 equals `no_of_shares` on a large parcel, the row is flagged

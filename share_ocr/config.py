@@ -115,6 +115,13 @@ CSV_HEADER_ALIASES = {
 SOURCE_FILE_HEADER = next(h for h, s in CSV_SPEC if s == "@source_file")
 CERT_NO_HEADER = next(h for h, s in CSV_SPEC if s == "certificate_no")
 
+# Headers csv_writer.failed_file_row needs to fill in for a file that never
+# produced an extraction at all - see that function for why those rows live
+# in the main CSV now instead of a separate needs-review sidecar.
+REVIEW_HEADER = next(h for h, s in CSV_SPEC if s == "@review")
+FLAGS_HEADER = next(h for h, s in CSV_SPEC if s == "validation_flags")
+EXTRACTED_AT_HEADER = next(h for h, s in CSV_SPEC if s == "@extracted_at")
+
 # The "Review" column is "Yes" only for rows with a HARD problem. These two
 # advisories are SOFT: they fire on perfectly good rows - a billed add-on the
 # certificate simply doesn't print, or a transfer log worth an eyeball - so on

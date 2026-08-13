@@ -27,7 +27,7 @@ from typing import Callable, Dict, Iterator, List, Optional, Tuple
 
 from . import db
 from .config import SUPPORTED_EXT, Settings
-from .csv_writer import ShardedCsvWriter, record_to_row
+from .csv_writer import ShardedCsvWriter, failed_file_row, record_to_row
 from .extractor import build_engine, validate
 
 log = logging.getLogger("share_ocr")
@@ -241,6 +241,21 @@ class Pipeline:
                                    self.s.max_attempts)
             if status == db.DEAD:
                 self.stats.bump(failed=1)
+                # Give up for good: record it as a blank placeholder row in
+                # the CSV (Review=Yes, Source File still linked, the error in
+                # Validation Flags) rather than let it vanish with no trace
+                # in the deliverable. Only on the FINAL failure - a merely
+                # 'failed' file is still going to be retried automatically
+                # on the next claim, and writing a row for every attempt
+                # would put duplicate placeholder rows in the CSV for a file
+                # that then goes on to succeed.
+                try:
+                    self.csv.write(failed_file_row(name, path, str(e)))
+                except Exception as csv_e:              # noqa: BLE001
+                    self.on_log(f"WARN {name}: could not record the failed "
+                               f"file in the CSV ({type(csv_e).__name__}: "
+                               f"{csv_e}) - close the CSV file if it is open "
+                               "in Excel.")
             # Logged to the file only (share_ocr.log), never pushed through
             # on_log - the GUI status bar must never flash a scary per-file
             # error. The multi-key pool (see extractor.KeyPool) already
