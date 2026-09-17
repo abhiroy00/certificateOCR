@@ -135,9 +135,53 @@ def main() -> int:
     assert requeued > 0
     assert p.q.counts()["pending"] == requeued
 
+    # 7) start() must not let a worker's cached engine (built off whatever
+    # API keys/settings existed the first time that thread id ever called
+    # _engine()) outlive the run it was built for. Python/the OS can and
+    # does recycle a terminated thread's id for a brand new thread, so
+    # without clearing this cache at the top of every start(), a key added
+    # (or removed, or a model changed) after the first Extract of the
+    # session could silently never take effect for the rest of the app's
+    # life - see Pipeline.start().
+    p._engines[999999] = "stale-engine-sentinel"
+    p.start()
+    assert 999999 not in p._engines, (
+        "start() left a stale cached engine in place - "
+        "newly added/removed API keys would never be picked up")
+    p.stop()
+    p.join()
+
+    # 8) claim_batch (200 by default) is sized for the 30-lakh job. On a
+    # normal day-to-day run - tens to a few hundred certificates, everything
+    # this app is actually run on most of the time - 200 is bigger than the
+    # whole job, so the FIRST worker to call claim() used to take every file
+    # in one shot and every other configured worker (and every extra API key
+    # in the pool) sat idle for the entire run. start() must size THIS run's
+    # claim to a fair per-worker share instead, capped by claim_batch.
+    small_tmp = Path(tempfile.mkdtemp(prefix="share_ocr_fairshare_"))
+    small_scans = small_tmp / "scans"
+    make_fixtures(small_scans, 24)
+    s2 = Settings()
+    s2.workdir = small_tmp / "home"
+    s2.engine = install_stub()
+    s2.workers = 4
+    s2.claim_batch = 200          # the large, mega-batch default
+    s2.csv_flush_rows = 1
+    s2.ensure_dirs()
+    p2 = Pipeline(s2, on_log=lambda m: None)
+    p2.ingest([str(small_scans)])
+    p2.start()
+    assert p2._claim_batch == 6, (          # ceil(24 files / 4 workers)
+        f"expected a fair 6-file share per worker, got {p2._claim_batch} - "
+        "a worker would grab everything and the others would sit idle")
+    p2.join()
+    assert p2.counts()["rows"] == 24, p2.counts()
+    shutil.rmtree(small_tmp, ignore_errors=True)
+
     print(f"OK  {n} files -> {c['rows']} rows -> {len(shards)} CSV shard(s)")
     print(f"    merged: {merged}")
     print(f"    resume: {requeued} stale rows re-queued")
+    print(f"    fair-share claim_batch: 24 files / 4 workers -> {p2._claim_batch}/claim")
     shutil.rmtree(tmp, ignore_errors=True)
     return 0
 

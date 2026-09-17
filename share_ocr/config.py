@@ -311,6 +311,25 @@ class Settings:
     model: str = os.environ.get("SHARE_OCR_MODEL", "gpt-4o-mini")
     api_key_env: str = "OPENAI_API_KEY"
     base_url: str = os.environ.get("OPENAI_BASE_URL", "")
+    # The "openai" engine calls whichever provider a given key belongs to -
+    # OpenAI keys AND NVIDIA keys are pooled together (see extractor.KeyPool
+    # / secrets.PROVIDERS), each request using the right model/base_url for
+    # whichever key it landed on. NVIDIA keys are typically much cheaper per
+    # image, so adding some alongside OpenAI keys lowers the average cost of
+    # a bulk run without a second manual pass. nvidia_model/nvidia_base_url
+    # only need changing if NVIDIA retires the default model - there is no
+    # separate "nvidia" engine to switch to.
+    # The 90b variant is listed on every NVIDIA key we have tried but never
+    # actually answers a request (confirmed live: 150s+ with zero response,
+    # even for a one-word text-only prompt with no image) - looks like it is
+    # not really available behind NVIDIA's shared/free inference tier despite
+    # showing up in models.list(). The 11b variant responds in ~1-25s and
+    # reads these certificates correctly; it is the one actually usable
+    # today. If NVIDIA's catalog changes, override via NVIDIA_MODEL or here.
+    nvidia_model: str = os.environ.get("NVIDIA_MODEL",
+                                       "meta/llama-3.2-11b-vision-instruct")
+    nvidia_base_url: str = os.environ.get(
+        "NVIDIA_BASE_URL", "https://integrate.api.nvidia.com/v1")
     # Full path to tesseract.exe / tesseract. Blank means "find it on PATH or
     # in the usual install folders".
     tesseract_cmd: str = os.environ.get("TESSERACT_CMD", "")

@@ -28,7 +28,7 @@ from typing import Callable, Dict, Iterator, List, Optional, Tuple
 from . import db
 from .config import SUPPORTED_EXT, Settings
 from .csv_writer import ShardedCsvWriter, failed_file_row, record_to_row
-from .extractor import build_engine, validate
+from .extractor import build_engine, is_quota_exhausted, validate
 
 log = logging.getLogger("share_ocr")
 
@@ -122,6 +122,7 @@ class Pipeline:
         self._engines: Dict[int, object] = {}
         self._engine_lock = threading.Lock()
         self._scope_ids: Optional[List[int]] = None
+        self._claim_batch = settings.claim_batch   # start() recomputes a fair share
 
     # ---------------------------------------------------------- ingest --
     def ingest(self, roots: List[str], batch: Optional[str] = None) -> int:
@@ -165,10 +166,39 @@ class Pipeline:
         job relies on.
         """
         self._stop.clear()
+        # Force every worker to rebuild its engine (and, for the "openai"
+        # engine, its KeyPool - see extractor.py) from CURRENT settings at
+        # the start of every run, rather than reusing whatever was cached
+        # the first time a worker thread with this same thread id ever
+        # called _engine(). Python/the OS can and does recycle a terminated
+        # thread's id for a brand new thread, so without this an API key
+        # added (or removed) after the first Extract of the session could
+        # silently never be picked up - a worker "lucky" enough to reuse an
+        # old id kept using the stale pool for the rest of the app's life,
+        # with no error, just requests that never went to the new key.
+        with self._engine_lock:
+            self._engines.clear()
         self._scope_ids = list(scope_ids) if scope_ids is not None else None
         self.q.requeue_stale()
         c = self.q.counts_for(self._scope_ids) if self._scope_ids is not None else self.q.counts()
         self.stats = Stats(total=c["total"], done=c[db.DONE], failed=c[db.DEAD])
+        # claim_batch (200 by default) is sized for the 30-lakh job: with
+        # millions of files, every worker still gets plenty of work even
+        # after the first one grabs 200. On a normal day-to-day run (tens to
+        # a few hundred certificates - everything this app has actually been
+        # run on in this session), 200 is bigger than the whole job, so the
+        # FIRST worker to call claim() took the entire batch in one shot and
+        # every other worker found nothing left and sat idle - the "workers"
+        # setting, and every extra API key in the pool, silently did
+        # nothing. Capping this run's claim size to a fair per-worker share
+        # (still never above the configured claim_batch) is what actually
+        # lets multiple files - and therefore multiple keys, including
+        # NVIDIA ones - run side by side instead of one worker grinding
+        # through everything alone.
+        remaining = c.get(db.PENDING, 0) + c.get(db.FAILED, 0)
+        self._claim_batch = max(1, min(
+            self.s.claim_batch,
+            -(-remaining // max(1, self.s.workers))))   # ceil(remaining / workers)
         self._threads = [
             threading.Thread(target=self._worker, args=(i,), daemon=True,
                              name=f"ocr-{i}")
@@ -200,7 +230,7 @@ class Pipeline:
         while not self._stop.is_set():
             while self._pause.is_set() and not self._stop.is_set():
                 time.sleep(0.25)
-            rows = q.claim(self.s.claim_batch, worker=f"w{idx}",
+            rows = q.claim(self._claim_batch, worker=f"w{idx}",
                           scope_ids=self._scope_ids)
             if not rows:
                 # DUPLICATE-ROW BUG (fixed): the old code probed for work with
@@ -234,11 +264,30 @@ class Pipeline:
             for rec in records:
                 rec["validation_flags"] = validate(
                     rec, flag_addons=self.s.flag_missing_addons)
+                # Not a processing bug - a genuinely different source file
+                # (e.g. "1234.pdf" and "1234_merged.pdf") that happens to be
+                # the same certificate. Flag it instead of silently letting
+                # it look like the same file got extracted twice.
+                dupe_of = q.find_duplicate_source(
+                    rec.get("certificate_no"), rec.get("company_name"), file_id)
+                if dupe_of:
+                    note = f"Possible duplicate: same certificate also extracted from {dupe_of}"
+                    rec["validation_flags"] = (
+                        f"{rec['validation_flags']}; {note}"
+                        if rec["validation_flags"] else note)
             latency = int((time.time() - t0) * 1000)
             row_ids = q.mark_done(file_id, records, engine.name, self.s.model, latency)
         except Exception as e:                      # noqa: BLE001
-            status = q.mark_failed(file_id, f"{type(e).__name__}: {e}",
-                                   self.s.max_attempts)
+            err = f"{type(e).__name__}: {e}"
+            # Every configured key came back "no credits" - say so in plain
+            # language, right where the operator will actually see it (the
+            # Failed tab, and Validation Flags on the placeholder CSV row
+            # below), instead of a wall of JSON they have to go decode.
+            if is_quota_exhausted(err):
+                err = ("OUT OF CREDITS - add billing at platform.openai.com/"
+                       "settings/organization/billing, then click Retry "
+                       f"failed. ({err})")
+            status = q.mark_failed(file_id, err, self.s.max_attempts)
             if status == db.DEAD:
                 self.stats.bump(failed=1)
                 # Give up for good: record it as a blank placeholder row in

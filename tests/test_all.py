@@ -17,6 +17,7 @@ SUITES = [
     ("golden sample certificates", "tests.test_golden"),
     ("OTP access gate logic", "tests.test_otp_auth"),
     ("OTP sign-in screen (headless)", "tests.test_login_gate"),
+    ("API key pool / error classification", "tests.test_extractor"),
 ]
 
 

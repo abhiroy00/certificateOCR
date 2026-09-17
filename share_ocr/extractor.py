@@ -21,6 +21,7 @@ import shutil
 import tempfile
 import threading
 import time
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional
@@ -228,15 +229,44 @@ class BaseEngine:
                     pass
 
 
+@dataclass(frozen=True)
+class ProviderKey:
+    """One API key, tagged with which provider it belongs to and which
+    model/endpoint a request on it should use. NVIDIA's NIM endpoint speaks
+    the same OpenAI-compatible chat.completions API, just at a different
+    base_url with different model names, so a ProviderKey is all
+    OpenAIEngine needs to treat any key - OpenAI or NVIDIA - the same way."""
+    provider: str
+    key: str
+    base_url: str      # "" = the openai SDK's own default (api.openai.com)
+    model: str
+
+    @property
+    def identity(self) -> tuple:
+        """What cooldown bookkeeping keys on - provider+key, not model/url,
+        so the identity of one physical key never changes even if settings
+        (e.g. which NVIDIA model to use) do."""
+        return (self.provider, self.key)
+
+
 class KeyPool:
-    """Round-robins requests across every configured OpenAI API key.
+    """Round-robins requests across every configured API key, from BOTH
+    providers (OpenAI and NVIDIA) at once.
 
     The GUI's "API keys" dialog lets an operator add as many keys as they
-    want (4, 10, whatever their OpenAI account setup allows). Spreading
-    requests across all of them and moving a request to the next key the
-    moment one is rate-limited or out of quota is what lets a bulk run avoid
-    ever needing a manual "retry failed" step - the pool self-heals instead
-    of the file dead-lettering.
+    want, for either provider (mixing both is the point - NVIDIA keys are
+    typically much cheaper per image, so a pool of "some OpenAI, some
+    NVIDIA" lowers the average cost of a bulk run without a second manual
+    pass over the ones that "should" have gone to the cheaper provider).
+    Spreading requests across all of them and moving a request to the next
+    key the moment one is rate-limited or out of quota is what lets a bulk
+    run avoid ever needing a manual "retry failed" step - the pool self-heals
+    instead of the file dead-lettering.
+
+    One file is still only ever sent to ONE key on any given attempt -
+    OpenAIEngine._complete() returns as soon as any key succeeds - so mixing
+    providers here never means a document gets extracted twice; it only
+    changes which single provider ends up doing the work.
 
     Shared across every worker thread (see `_pool_for`), because the whole
     point is a global rotation: if each thread kept its own round-robin
@@ -244,37 +274,44 @@ class KeyPool:
     once while another sat idle.
     """
 
-    def __init__(self, keys: List[str]):
-        self.keys = list(keys)
+    def __init__(self, entries: List[ProviderKey]):
+        self.entries = list(entries)
         self._lock = threading.Lock()
         self._idx = 0
-        self._cooldown_until: Dict[str, float] = {}
+        self._cooldown_until: Dict[tuple, float] = {}
 
     def __bool__(self) -> bool:
-        return bool(self.keys)
+        return bool(self.entries)
 
-    def cooldown(self, key: str, seconds: float) -> None:
+    def __len__(self) -> int:
+        return len(self.entries)
+
+    def cooldown(self, identity: tuple, seconds: float) -> None:
         with self._lock:
-            self._cooldown_until[key] = time.time() + seconds
+            self._cooldown_until[identity] = time.time() + seconds
 
-    def order(self) -> List[str]:
+    def order(self) -> List[ProviderKey]:
         """Keys to try for one request, starting from the next round-robin
         slot, healthy keys before ones still cooling down from a recent
-        rate-limit/quota error.
+        rate-limit/quota error. OpenAI and NVIDIA entries are interleaved in
+        whatever order they were added, rotating together - there is no
+        separate "prefer this provider" step, so cost savings come purely
+        from however many of each kind of key are actually in the pool.
 
         Side-effecting: every call advances the round-robin pointer, so this
         is meant to be called exactly once per request (as _complete() does).
         Calling it an extra time - e.g. to log or inspect the order - skews
         which key the next real request starts from."""
         with self._lock:
-            if not self.keys:
+            if not self.entries:
                 return []
-            n = len(self.keys)
-            seq = [self.keys[(self._idx + i) % n] for i in range(n)]
+            n = len(self.entries)
+            seq = [self.entries[(self._idx + i) % n] for i in range(n)]
             self._idx = (self._idx + 1) % n
             now = time.time()
-            healthy = [k for k in seq if self._cooldown_until.get(k, 0) <= now]
-            cooling = [k for k in seq if k not in healthy]
+            healthy = [e for e in seq
+                      if self._cooldown_until.get(e.identity, 0) <= now]
+            cooling = [e for e in seq if e not in healthy]
         return healthy + cooling
 
 
@@ -282,27 +319,100 @@ _pool_cache: Dict[tuple, KeyPool] = {}
 _pool_cache_lock = threading.Lock()
 
 
+def _pool_entries(settings: Settings) -> List[ProviderKey]:
+    entries = [ProviderKey("openai", k, settings.base_url, settings.model)
+              for k in list_api_keys(settings, "openai")]
+    entries += [ProviderKey("nvidia", k, settings.nvidia_base_url,
+                            settings.nvidia_model)
+               for k in list_api_keys(settings, "nvidia")]
+    return entries
+
+
 def _pool_for(settings: Settings) -> KeyPool:
-    """One KeyPool per distinct key set + base_url, shared across threads."""
-    keys = tuple(list_api_keys(settings))
-    cache_key = (keys, settings.base_url)
+    """One KeyPool per distinct combination of keys/models/base_urls from
+    BOTH providers, shared across threads."""
+    entries = _pool_entries(settings)
+    cache_key = tuple((e.provider, e.key, e.base_url, e.model) for e in entries)
     with _pool_cache_lock:
         pool = _pool_cache.get(cache_key)
         if pool is None:
-            pool = KeyPool(list(keys))
+            pool = KeyPool(entries)
             _pool_cache[cache_key] = pool
         return pool
+
+
+# OpenAI reports both of these as HTTP 429, but they are not the same kind
+# of problem. A per-minute rate limit ("tokens"/"requests" rate_limit_exceeded)
+# is self-resolving in seconds. "insufficient_quota" (credit_balance_exhausted,
+# or a monthly quota used up) means the account has no money behind it right
+# now and will keep failing every single time, forever, until billing is
+# fixed - cooling that key down for only 30s (see RATE_LIMIT_COOLDOWN_S) made
+# it look "healthy" again almost immediately, so the pool kept re-trying a
+# permanently broken key, burning through a file's max_attempts on nothing
+# but repeats of the same billing error instead of ever getting a real shot.
+_QUOTA_EXHAUSTED_MARKERS = ("insufficient_quota", "credit_balance_exhausted",
+                           "no credits remaining", "exceeded your current quota")
+
+
+def is_quota_exhausted(msg: str) -> bool:
+    """True for a billing/credits problem, as opposed to a transient
+    per-minute rate limit - see the note on _QUOTA_EXHAUSTED_MARKERS."""
+    m = (msg or "").lower()
+    return any(s in m for s in _QUOTA_EXHAUSTED_MARKERS)
+
+
+# response_format={"type": "json_object"} reliably constrains OpenAI's
+# models, but was confirmed live NOT to be reliably honoured by NVIDIA's
+# smaller vision models: meta/llama-3.2-11b-vision-instruct read a
+# certificate correctly but answered in prose bullet points instead of JSON
+# until these were added. Applied to every request, OpenAI included -  it is
+# a harmless no-op there and cheap insurance if NVIDIA's catalog changes
+# again to some other model with the same quirk.
+_JSON_ONLY_SYSTEM = ("You output ONLY a single valid JSON object - no "
+                    "explanation, no markdown formatting, no text before or "
+                    "after it.")
+_JSON_ONLY_SUFFIX = ("\n\nCRITICAL: Respond with ONLY the raw JSON object "
+                     "requested above - no explanation, no markdown code "
+                     "fences, no bullet points, nothing else. Your entire "
+                     "response must start with { and end with }.")
+_JSON_BLOCK_RE = re.compile(r"\{.*\}", re.DOTALL)
+
+
+def _parse_json_response(content: Optional[str]) -> dict:
+    """A direct parse covers every model that honours response_format, which
+    is the common, correct case. The fallback - pulling out the largest
+    {...} block - recovers a model's answer even when it wraps the JSON in
+    prose or markdown despite being told not to (see _JSON_ONLY_SUFFIX)."""
+    try:
+        return json.loads(content)
+    except (json.JSONDecodeError, TypeError):
+        if content:
+            m = _JSON_BLOCK_RE.search(content)
+            if m:
+                return json.loads(m.group(0))
+        raise
 
 
 class OpenAIEngine(BaseEngine):
     name = "openai"
 
     # How long a key sits out after hitting a rate limit / quota error
-    # before being tried again - long enough that OpenAI's per-minute window
-    # has actually reset. An auth error (bad/revoked key) parks it much
-    # longer, since that will not fix itself.
+    # before being tried again. Plain per-minute rate limits reset in
+    # seconds; an out-of-credits key or a bad/revoked key will not fix
+    # itself that fast, so both get parked for much longer instead of being
+    # retried every 30s for no benefit.
     RATE_LIMIT_COOLDOWN_S = 30.0
+    QUOTA_EXHAUSTED_COOLDOWN_S = 3600.0
     AUTH_ERROR_COOLDOWN_S = 3600.0
+    # A request that timed out (request_timeout, currently 90s) already cost
+    # a full timeout's worth of wall-clock time on this one call. Without a
+    # cooldown here, a key having a slow moment (observed in practice on
+    # NVIDIA's free/hosted vision models, whose latency varies far more than
+    # OpenAI's) got retried at full priority on every single following file,
+    # each paying the same 90s before falling through - a handful of slow
+    # keys could make a whole bulk run crawl. Parking it for a bit lets
+    # healthy keys carry the load while this one gets a chance to recover.
+    TIMEOUT_COOLDOWN_S = 45.0
 
     def __init__(self, settings: Settings):
         super().__init__(settings)
@@ -312,69 +422,98 @@ class OpenAIEngine(BaseEngine):
         self.pool = _pool_for(settings)
         if not self.pool:
             raise RuntimeError(
-                "No OpenAI API key configured. Add one or more keys in the "
-                "GUI (the API keys button), run `python -m share_ocr.cli key "
-                f"--set`, or export {settings.api_key_env} / OPENAI_API_KEYS.")
+                "No API key configured for either provider. Add at least "
+                "one OpenAI or NVIDIA key in the GUI (the API keys button), "
+                "or export "
+                f"{settings.api_key_env} / OPENAI_API_KEYS / NVIDIA_API_KEYS.")
         self._client_kwargs = {"timeout": settings.request_timeout,
                                "max_retries": 0}  # we do our own backoff
-        if settings.base_url:
-            self._client_kwargs["base_url"] = settings.base_url
-        self._clients: Dict[str, object] = {}
+        self._clients: Dict[tuple, object] = {}
         self._clients_lock = threading.Lock()
 
-    def _client_for(self, key: str):
-        client = self._clients.get(key)
+    def _client_for(self, pk: ProviderKey):
+        ident = pk.identity
+        client = self._clients.get(ident)
         if client is None:
             with self._clients_lock:
-                client = self._clients.get(key)
+                client = self._clients.get(ident)
                 if client is None:
-                    client = self._OpenAI(api_key=key, **self._client_kwargs)
-                    self._clients[key] = client
+                    kwargs = dict(self._client_kwargs, api_key=pk.key)
+                    if pk.base_url:
+                        kwargs["base_url"] = pk.base_url
+                    client = self._OpenAI(**kwargs)
+                    self._clients[ident] = client
         return client
 
     def _complete(self, messages: List[Dict]) -> Dict:
         """Call chat.completions, trying every key in the pool (healthiest
-        first) before giving up. A rate-limit/quota error on one key just
-        moves to the next; only a non-key-related error, or every key
-        failing, raises."""
+        first, OpenAI and NVIDIA keys mixed together) before giving up. Only
+        ONE of them ever actually answers - the loop returns on the first
+        success - so a file is never billed or extracted twice no matter how
+        many keys are configured.
+
+        A rate-limit/quota error on one key just moves to the next. A
+        non-key-related error (a malformed request, a model that rejects one
+        of the parameters used here) is assumed to be a property of that
+        PROVIDER's model/endpoint, not the individual key - retrying it on
+        every other key of the SAME provider would just repeat it, so those
+        are skipped, but a different provider is a genuinely different
+        system and still gets tried. Only raises once nothing in the pool
+        was able to answer."""
         order = self.pool.order()
         last_exc: Optional[Exception] = None
-        for key in order:
+        skip_providers: set = set()
+        for pk in order:
+            if pk.provider in skip_providers:
+                continue
             try:
-                resp = self._client_for(key).chat.completions.create(
-                    model=self.s.model,
+                resp = self._client_for(pk).chat.completions.create(
+                    model=pk.model,
                     temperature=0,
                     response_format={"type": "json_object"},
                     messages=messages,
                 )
-                data = json.loads(resp.choices[0].message.content)
+                data = _parse_json_response(resp.choices[0].message.content)
                 return {k: data.get(k) for k in FIELDS}
             except Exception as e:                          # noqa: BLE001
                 last_exc = e
                 msg = str(e).lower()
-                if any(s in msg for s in ("rate limit", "429", "quota",
-                                          "insufficient_quota", "overloaded",
+                # Checked before the generic rate-limit case below: OpenAI
+                # reports insufficient_quota as HTTP 429 too, so this must
+                # be matched first or it is misread as a transient limit.
+                if is_quota_exhausted(msg):
+                    self.pool.cooldown(pk.identity, self.QUOTA_EXHAUSTED_COOLDOWN_S)
+                    continue
+                if any(s in msg for s in ("rate limit", "429", "overloaded",
                                           "503", "502")):
-                    self.pool.cooldown(key, self.RATE_LIMIT_COOLDOWN_S)
+                    self.pool.cooldown(pk.identity, self.RATE_LIMIT_COOLDOWN_S)
                     continue
                 if any(s in msg for s in ("401", "invalid_api_key",
                                           "incorrect api key", "account_deactivated")):
-                    self.pool.cooldown(key, self.AUTH_ERROR_COOLDOWN_S)
+                    self.pool.cooldown(pk.identity, self.AUTH_ERROR_COOLDOWN_S)
                     continue
-                raise  # not key-related - trying another key would not help
-        raise last_exc or RuntimeError("No OpenAI API key available")
+                if any(s in msg for s in ("timeout", "timed out", "connection")):
+                    # Transient (network blip, or this key/endpoint having a
+                    # slow moment) - still worth trying again later, unlike
+                    # the "not key-related, this model will always reject
+                    # this request" case below.
+                    self.pool.cooldown(pk.identity, self.TIMEOUT_COOLDOWN_S)
+                    continue
+                skip_providers.add(pk.provider)
+                continue
+        raise last_exc or RuntimeError("No API key available")
 
     def extract_image(self, image_path: str) -> Dict:
         b64 = downscale_to_jpeg_b64(image_path, self.s.max_image_px, self.s.jpeg_quality)
-        return self._complete([{
-            "role": "user",
-            "content": [
-                {"type": "text", "text": PROMPT},
+        return self._complete([
+            {"role": "system", "content": _JSON_ONLY_SYSTEM},
+            {"role": "user", "content": [
+                {"type": "text", "text": PROMPT + _JSON_ONLY_SUFFIX},
                 {"type": "image_url",
                  "image_url": {"url": f"data:image/jpeg;base64,{b64}",
                                "detail": "high"}},
-            ],
-        }])
+            ]},
+        ])
 
     def extract_document(self, image_paths: List[str]) -> Dict:
         """Read every page of one certificate in a single request, so a
@@ -382,13 +521,16 @@ class OpenAIEngine(BaseEngine):
         same certificate instead of being force-fit into its own row."""
         if len(image_paths) == 1:
             return self.extract_image(image_paths[0])
-        content: List[Dict] = [{"type": "text", "text": PROMPT_MULTI_PAGE}]
+        content: List[Dict] = [{"type": "text", "text": PROMPT_MULTI_PAGE + _JSON_ONLY_SUFFIX}]
         for p in image_paths:
             b64 = downscale_to_jpeg_b64(p, self.MULTI_PAGE_MAX_PX, self.s.jpeg_quality)
             content.append({"type": "image_url",
                             "image_url": {"url": f"data:image/jpeg;base64,{b64}",
                                           "detail": "high"}})
-        return self._complete([{"role": "user", "content": content}])
+        return self._complete([
+            {"role": "system", "content": _JSON_ONLY_SYSTEM},
+            {"role": "user", "content": content},
+        ])
 
 
 class TesseractEngine(BaseEngine):

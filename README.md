@@ -220,40 +220,49 @@ bar, so the eye goes to the data. Row tints: **blue** = a billed add-on is
 missing, **amber** = a core field failed validation, alternating **`#fafbfd`**
 otherwise. A legend above the table explains both.
 
-## Where to put the OpenAI API key(s)
+## Where to put the API key(s) - OpenAI and/or NVIDIA
 
 There is no need to touch the terminal. Open the GUI and click **API keys**
-in the top bar (the coloured dot next to it is red until at least one key is
-configured, green once it is). Paste a key and press **Add key** - repeat
-for as many keys as you have. Use **Test** next to any key to confirm it
-works before you queue three million images.
+in the top bar (the coloured dot next to it is red until at least one key -
+either provider - is configured, green once it is). Pick **OpenAI** or
+**NVIDIA** with the radio buttons at the top of the dialog, paste a key and
+press **Add key** - repeat for as many keys as you have, of either or both
+providers. Use **Test** next to any key to confirm it works before you queue
+three million images.
 
-**Why more than one key matters:** extraction round-robins across every key
-in the pool and moves a request to the next key the instant one hits a rate
-limit or runs out of quota (see `extractor.KeyPool`), instead of failing the
-file. With a handful of keys in the pool, a single key's limit essentially
-never stalls or fails a run - there is deliberately no manual "retry failed"
-button in the GUI, because the pool is meant to make one unnecessary.
+**Two providers, one pool.** Extraction is still a single "openai" engine -
+there is no separate "nvidia" engine to switch to. Every key you add, from
+either provider, goes into the same pool (`extractor.KeyPool`) that every
+worker draws from, round-robin, moving to the next key the instant one hits
+a rate limit or runs out of quota instead of failing the file. A file is
+still only ever sent to **one** key on a given attempt - the moment any key
+answers, extraction stops there, so mixing providers never means a document
+gets billed or extracted twice, it only changes which provider happened to
+answer it. With a handful of keys in the pool (of either kind), a single
+key's limit essentially never stalls or fails a run - there is deliberately
+no manual "retry failed" button in the GUI, because the pool is meant to
+make one unnecessary.
 
-The same thing from the command line, with hidden input so a key never lands
-in your shell history or in `ps` output:
-
-```bash
-python -m share_ocr.cli key --set     # hidden prompt
-python -m share_ocr.cli key --test    # verify it works
-python -m share_ocr.cli key           # show status (masked)
-python -m share_ocr.cli key --remove  # delete it from this machine
-```
+**Why add NVIDIA keys at all:** NVIDIA's [build.nvidia.com](https://build.nvidia.com)
+catalog exposes vision-capable models (the default here is
+`meta/llama-3.2-90b-vision-instruct`) through an OpenAI-compatible endpoint,
+typically at a lower cost per image than OpenAI. Mixing some NVIDIA keys
+into the pool alongside OpenAI keys lowers the average cost of a bulk run
+without a second manual pass to figure out which files "should" have gone
+to the cheaper provider - the pool just uses whatever is healthy and
+available. `nvidia_model` / `nvidia_base_url` in `settings.json` only need
+changing if NVIDIA retires the default model from their catalog.
 
 ### The three places keys can come from
 
-Read in this order, first hit wins - each source can hold multiple keys:
+Read in this order, first hit wins - each source can hold multiple keys, and
+this applies independently to each provider:
 
 | # | Source | When to use it | Safety |
 |---|--------|----------------|--------|
-| 1 | `OPENAI_API_KEYS` environment variable (comma/semicolon/newline separated), or the single-key `OPENAI_API_KEY` | Servers, CI, the 30-lakh batch run | Never written to disk by us. Always overrides the two below. |
+| 1 | `OPENAI_API_KEYS` / `NVIDIA_API_KEYS` environment variable (comma/semicolon/newline separated), or the single-key `OPENAI_API_KEY` / `NVIDIA_API_KEY` | Servers, CI, the 30-lakh batch run | Never written to disk by us. Always overrides the two below. |
 | 2 | OS credential store (`keyring`) | **Default for the desktop GUI** | Encrypted by Windows Credential Manager / macOS Keychain / Linux Secret Service against your login. |
-| 3 | `<workdir>/credentials.json` | Machines with no keyring (bare Linux, portable installs) | Permissions `0600`, obfuscated with a machine-bound pad. |
+| 3 | `<workdir>/credentials.json` | Machines with no keyring (bare Linux, portable installs) | Permissions `0600`, obfuscated with a machine-bound pad. Both providers' keys live in this one file, under separate entries. |
 
 Install the keyring backend to get option 2:
 

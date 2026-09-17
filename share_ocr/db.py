@@ -13,11 +13,15 @@ job will certainly be interrupted at some point. The queue gives us:
 from __future__ import annotations
 
 import json
+import logging
 import sqlite3
 import threading
 import time
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple, TypeVar
+
+log = logging.getLogger("share_ocr")
+_T = TypeVar("_T")
 
 PENDING = "pending"
 RUNNING = "running"
@@ -60,6 +64,17 @@ CREATE TABLE IF NOT EXISTS results (
     UNIQUE(file_id, page_no)
 );
 CREATE INDEX IF NOT EXISTS idx_results_export ON results(exported, row_id);
+-- Lets find_duplicate_source() look a match up instead of scanning every
+-- row's JSON payload - without this the duplicate check gets slower with
+-- every certificate ever extracted into this queue.db, which on a bulk run
+-- (dozens-hundreds of files, each triggering the check) held the database
+-- busy long enough to cause "database is locked" under real-world
+-- contention (antivirus / cloud-sync briefly touching the file, several
+-- worker threads writing at once).
+CREATE INDEX IF NOT EXISTS idx_results_cert_dup ON results(
+    json_extract(payload, '$.certificate_no'),
+    json_extract(payload, '$.company_name')
+);
 
 CREATE TABLE IF NOT EXISTS meta (
     key   TEXT PRIMARY KEY,
@@ -78,12 +93,64 @@ class Queue:
         self._claim_lock = threading.Lock()
         with self._conn_new() as c:
             c.executescript(SCHEMA)
+            mode = c.execute("PRAGMA journal_mode").fetchone()[0]
+            if str(mode).lower() != "wal":
+                # journal_mode=WAL silently falls back instead of raising
+                # when the filesystem can't support it (a network drive, a
+                # OneDrive-synced folder, some external USB drives) - when
+                # that happens every writer takes an exclusive lock instead
+                # of coexisting with readers, which is the single most
+                # common real-world cause of "database is locked" on a
+                # client machine. Logged here so it shows up in
+                # share_ocr.log instead of only as a vague crash later.
+                log.warning(
+                    "queue.db could not enable WAL mode (using '%s' instead) "
+                    "at %s - if this machine keeps hitting 'database is "
+                    "locked', move the app's data folder (Settings > "
+                    "SHARE_OCR_HOME, default ~/.share_ocr) off any "
+                    "OneDrive/Dropbox-synced or network path.",
+                    mode, self.db_path)
 
     # ------------------------------------------------------------------
     def _conn_new(self) -> sqlite3.Connection:
         c = sqlite3.connect(self.db_path, timeout=60, isolation_level=None)
         c.execute("PRAGMA busy_timeout=60000")
         return c
+
+    @staticmethod
+    def _retry_locked(conn: sqlite3.Connection, fn: Callable[[], _T],
+                      attempts: int = 6, base_delay: float = 0.5) -> _T:
+        """Run a DB write (fn does its own BEGIN...COMMIT on conn), retrying
+        a few times on 'database is locked' / 'database is busy'.
+        busy_timeout already makes SQLite itself wait out most contention,
+        but a lock that outlasts even that (antivirus or a sync client
+        holding the file, several workers writing at once on a slower disk)
+        used to surface immediately as a fatal error and abort the whole
+        run. This gives it a few more seconds, total, to clear - actual bugs
+        (a bad query, a schema error) are never 'locked'/'busy' and still
+        raise straight away. A failed attempt may have left a transaction
+        open (BEGIN succeeded, the statement or COMMIT inside it didn't), so
+        each retry rolls back first - harmless if there was nothing to roll
+        back."""
+        delay = base_delay
+        for attempt in range(attempts):
+            try:
+                return fn()
+            except sqlite3.OperationalError as e:
+                msg = str(e).lower()
+                if "locked" not in msg and "busy" not in msg:
+                    raise
+                try:
+                    conn.execute("ROLLBACK")
+                except sqlite3.OperationalError:
+                    pass
+                if attempt == attempts - 1:
+                    raise
+                log.warning("database busy (attempt %d/%d), retrying in %.1fs: %s",
+                           attempt + 1, attempts, delay, e)
+                time.sleep(delay)
+                delay *= 2
+        raise AssertionError("unreachable")   # pragma: no cover
 
     @property
     def conn(self) -> sqlite3.Connection:
@@ -119,18 +186,20 @@ class Queue:
             added += self._flush_insert(conn, buf)
         return added
 
-    @staticmethod
-    def _flush_insert(conn: sqlite3.Connection, buf: Sequence[Tuple]) -> int:
-        cur = conn.cursor()
-        cur.execute("BEGIN")
-        cur.executemany(
-            "INSERT OR IGNORE INTO files(path, name, size, batch, status, updated_at)"
-            " VALUES(?,?,?,?,'pending',?)",
-            buf,
-        )
-        n = cur.rowcount if cur.rowcount and cur.rowcount > 0 else 0
-        cur.execute("COMMIT")
-        return n
+    @classmethod
+    def _flush_insert(cls, conn: sqlite3.Connection, buf: Sequence[Tuple]) -> int:
+        def _txn() -> int:
+            cur = conn.cursor()
+            cur.execute("BEGIN")
+            cur.executemany(
+                "INSERT OR IGNORE INTO files(path, name, size, batch, status, updated_at)"
+                " VALUES(?,?,?,?,'pending',?)",
+                buf,
+            )
+            n = cur.rowcount if cur.rowcount and cur.rowcount > 0 else 0
+            cur.execute("COMMIT")
+            return n
+        return cls._retry_locked(conn, _txn)
 
     # ----------------------------------------------------------- claim --
     def claim(self, limit: int, worker: str,
@@ -148,32 +217,35 @@ class Queue:
         with self._claim_lock:
             conn = self.conn
             conn.row_factory = sqlite3.Row
-            cur = conn.cursor()
-            cur.execute("BEGIN IMMEDIATE")
-            if scope_ids is not None:
-                qs = ",".join("?" * len(scope_ids))
-                rows = cur.execute(
-                    f"SELECT id, path, name FROM files"
-                    f" WHERE status IN ('pending','failed') AND id IN ({qs})"
-                    f" ORDER BY id LIMIT ?",
-                    [*scope_ids, limit],
-                ).fetchall()
-            else:
-                rows = cur.execute(
-                    "SELECT id, path, name FROM files WHERE status IN ('pending','failed')"
-                    " ORDER BY id LIMIT ?",
-                    (limit,),
-                ).fetchall()
-            if rows:
-                ids = [r["id"] for r in rows]
-                qs = ",".join("?" * len(ids))
-                cur.execute(
-                    f"UPDATE files SET status='running', claimed_at=?, updated_at=?"
-                    f" WHERE id IN ({qs})",
-                    [time.time(), time.time(), *ids],
-                )
-            cur.execute("COMMIT")
-            return rows
+
+            def _txn() -> List[sqlite3.Row]:
+                cur = conn.cursor()
+                cur.execute("BEGIN IMMEDIATE")
+                if scope_ids is not None:
+                    qs = ",".join("?" * len(scope_ids))
+                    rows = cur.execute(
+                        f"SELECT id, path, name FROM files"
+                        f" WHERE status IN ('pending','failed') AND id IN ({qs})"
+                        f" ORDER BY id LIMIT ?",
+                        [*scope_ids, limit],
+                    ).fetchall()
+                else:
+                    rows = cur.execute(
+                        "SELECT id, path, name FROM files WHERE status IN ('pending','failed')"
+                        " ORDER BY id LIMIT ?",
+                        (limit,),
+                    ).fetchall()
+                if rows:
+                    ids = [r["id"] for r in rows]
+                    qs = ",".join("?" * len(ids))
+                    cur.execute(
+                        f"UPDATE files SET status='running', claimed_at=?, updated_at=?"
+                        f" WHERE id IN ({qs})",
+                        [time.time(), time.time(), *ids],
+                    )
+                cur.execute("COMMIT")
+                return rows
+            return self._retry_locked(conn, _txn)
 
     def resolve_ids(self, paths: Iterable[str]) -> List[int]:
         """File ids for exact paths — used to scope a GUI run to only the
@@ -229,41 +301,80 @@ class Queue:
     def mark_done(self, file_id: int, records: List[dict], engine: str,
                   model: str, latency_ms: int) -> List[int]:
         conn = self.conn
-        cur = conn.cursor()
-        cur.execute("BEGIN")
-        row_ids: List[int] = []
-        for i, rec in enumerate(records, start=1):
+
+        def _txn() -> List[int]:
+            cur = conn.cursor()
+            cur.execute("BEGIN")
+            row_ids: List[int] = []
+            for i, rec in enumerate(records, start=1):
+                cur.execute(
+                    "INSERT OR REPLACE INTO results"
+                    "(file_id, page_no, payload, flags, engine, model, latency_ms, created_at)"
+                    " VALUES(?,?,?,?,?,?,?,?)",
+                    (file_id, rec.get("page_no", i), json.dumps(rec, default=str),
+                     rec.get("validation_flags", ""), engine, model, latency_ms,
+                     time.time()),
+                )
+                row_ids.append(cur.lastrowid)
             cur.execute(
-                "INSERT OR REPLACE INTO results"
-                "(file_id, page_no, payload, flags, engine, model, latency_ms, created_at)"
-                " VALUES(?,?,?,?,?,?,?,?)",
-                (file_id, rec.get("page_no", i), json.dumps(rec, default=str),
-                 rec.get("validation_flags", ""), engine, model, latency_ms,
-                 time.time()),
+                "UPDATE files SET status='done', error=NULL, updated_at=? WHERE id=?",
+                (time.time(), file_id),
             )
-            row_ids.append(cur.lastrowid)
-        cur.execute(
-            "UPDATE files SET status='done', error=NULL, updated_at=? WHERE id=?",
-            (time.time(), file_id),
-        )
-        cur.execute("COMMIT")
-        return row_ids
+            cur.execute("COMMIT")
+            return row_ids
+        return self._retry_locked(conn, _txn)
+
+    def find_duplicate_source(self, certificate_no: str, company_name: str,
+                              exclude_file_id: int) -> Optional[str]:
+        """The name of ANOTHER already-extracted file whose certificate_no
+        and company_name both match, if one exists.
+
+        Used to catch the common operator mistake of a folder holding two
+        copies of the same certificate under different names (e.g. a plain
+        scan AND a "..._merged.pdf" of the same document) - both get
+        extracted correctly and independently, so this doesn't stop that,
+        it just flags the second one so it doesn't get mistaken for a real
+        duplicate-processing bug. Matches on certificate_no + company_name
+        together (not certificate_no alone) since certificate numbers are
+        only unique within one issuing company. Searches the whole database,
+        not just the current run, so a duplicate re-added in a later session
+        is still caught."""
+        certificate_no = (certificate_no or "").strip()
+        company_name = (company_name or "").strip()
+        if not certificate_no or not company_name:
+            return None
+        conn = self.conn
+
+        def _query() -> Optional[str]:
+            row = conn.execute(
+                "SELECT f.name FROM results r JOIN files f ON f.id = r.file_id"
+                " WHERE r.file_id != ?"
+                "   AND json_extract(r.payload, '$.certificate_no') = ?"
+                "   AND json_extract(r.payload, '$.company_name') = ?"
+                " LIMIT 1",
+                (exclude_file_id, certificate_no, company_name),
+            ).fetchone()
+            return row[0] if row else None
+        return self._retry_locked(conn, _query)
 
     def mark_failed(self, file_id: int, error: str, max_attempts: int) -> str:
         conn = self.conn
-        cur = conn.cursor()
-        cur.execute("BEGIN")
-        cur.execute("UPDATE files SET attempts = attempts + 1 WHERE id=?", (file_id,))
-        attempts = cur.execute(
-            "SELECT attempts FROM files WHERE id=?", (file_id,)
-        ).fetchone()[0]
-        status = DEAD if attempts >= max_attempts else FAILED
-        cur.execute(
-            "UPDATE files SET status=?, error=?, updated_at=? WHERE id=?",
-            (status, error[:1000], time.time(), file_id),
-        )
-        cur.execute("COMMIT")
-        return status
+
+        def _txn() -> str:
+            cur = conn.cursor()
+            cur.execute("BEGIN")
+            cur.execute("UPDATE files SET attempts = attempts + 1 WHERE id=?", (file_id,))
+            attempts = cur.execute(
+                "SELECT attempts FROM files WHERE id=?", (file_id,)
+            ).fetchone()[0]
+            status = DEAD if attempts >= max_attempts else FAILED
+            cur.execute(
+                "UPDATE files SET status=?, error=?, updated_at=? WHERE id=?",
+                (status, error[:1000], time.time(), file_id),
+            )
+            cur.execute("COMMIT")
+            return status
+        return self._retry_locked(conn, _txn)
 
     # ----------------------------------------------------------- stats --
     def counts(self) -> Dict[str, int]:

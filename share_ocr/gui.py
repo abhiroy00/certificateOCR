@@ -31,9 +31,8 @@ from .config import (APP_NAME, APP_VERSION, SUPPORTED_DOC, SUPPORTED_EXT,
                      SUPPORTED_IMG, Settings)
 from .extractor import make_thumbnail
 from .pipeline import Pipeline, Stats, scan_paths
-from .secrets import (add_api_key, describe, list_api_keys,
-                      looks_like_openai_key, mask, remove_api_key, resolve,
-                      test_key)
+from .secrets import (PROVIDERS, add_api_key, describe, list_api_keys,
+                      looks_like_key, mask, remove_api_key, resolve, test_key)
 from .theme import (AMBER_TINT, BG, BLUE, BLUE_EDGE, BLUE_HOVER, BLUE_TINT,
                     BORDER, CARD, GREEN, INK, INK_SOFT, MUTED, RED, ZEBRA,
                     apply_theme, card, enable_hidpi)
@@ -339,51 +338,73 @@ class App:
 
     # ---------------------------------------------------------- api key --
     def _refresh_key_status(self) -> None:
-        """Update the toolbar chip: green = at least one usable key."""
-        info = describe(self.s)
+        """Update the toolbar chip: green = at least one usable key, from
+        either provider - OpenAI and NVIDIA keys are pooled together (see
+        extractor.KeyPool), there is no separate engine to switch between
+        them, so the count combines both."""
+        infos = {p: describe(self.s, p) for p in PROVIDERS}
+        total = sum(i["count"] for i in infos.values())
         if self.s.engine != "openai":
             self.key_dot.configure(fg=MUTED)
             self.key_label.configure(text="API key not needed")
-        elif info["configured"]:
-            n = info["count"]
+        elif total:
+            parts = ["%d %s" % (i["count"], i["provider_label"])
+                    for i in infos.values() if i["count"]]
             self.key_dot.configure(fg=GREEN)
             self.key_label.configure(
                 text="%d API key%s  (%s)" % (
-                    n, "" if n == 1 else "s", info["source_label"]))
+                    total, "" if total == 1 else "s", " + ".join(parts)))
         else:
             self.key_dot.configure(fg=RED)
-            self.key_label.configure(text="Add OpenAI API key(s)")
+            self.key_label.configure(text="Add an OpenAI or NVIDIA API key")
 
     def open_api_key_dialog(self) -> None:
-        """Manage the pool of OpenAI API keys - add as many as you like.
+        """Manage the API key pools - OpenAI and NVIDIA, add as many keys of
+        either as you like.
 
-        Every worker draws from this shared pool (extractor.KeyPool) and
-        automatically moves to the next key if one is rate-limited or out of
-        quota, instead of failing the file. That is what lets a run avoid
-        ever needing a manual retry: the more keys in the pool, the less any
-        single key's limit can stall or fail a job. Keys are never echoed to
-        the screen by default and never written to the CSV, the log or the
-        queue database.
+        Every worker draws from ONE shared pool made of both providers'
+        keys together (extractor.KeyPool) and automatically moves to the
+        next key if one is rate-limited or out of quota, instead of failing
+        the file - a file only ever goes to whichever single key answers
+        first, never both. NVIDIA keys are usually much cheaper per image
+        than OpenAI's, so adding some alongside OpenAI keys lowers the
+        average cost of a run; there is no separate engine to switch
+        between them, both just feed the same "openai" engine's pool. Keys
+        are never echoed to the screen by default and never written to the
+        CSV, the log or the queue database.
         """
         t, px = self.t, self.t.px
         win = tk.Toplevel(self.root)
-        win.title("OpenAI API keys")
+        win.title("API keys")
         win.configure(bg=BG)
         win.transient(self.root)
         win.resizable(False, False)
 
         body = ttk.Frame(win, style="Card.TFrame", padding=(px(16), px(14)))
         body.pack(fill="both", expand=True)
-        ttk.Label(body, text="OpenAI API keys", style="Section.TLabel").pack(anchor="w")
+        ttk.Label(body, text="API keys", style="Section.TLabel").pack(anchor="w")
         ttk.Label(body, style="Muted.TLabel", wraplength=px(460), justify="left",
-                  text=("Add one or more keys. Extraction spreads requests "
-                        "across all of them and switches to the next key the "
-                        "moment one hits a rate limit or runs out of quota, "
-                        "so one key's limit never stalls or fails a run. "
-                        "Stored in your operating system's credential "
-                        "manager when available, otherwise in an obfuscated "
-                        "file only your user account can read.")
+                  text=("Add one or more keys, from either provider. "
+                        "Extraction spreads requests across every key from "
+                        "both pools and switches to the next the moment one "
+                        "hits a rate limit or runs out of quota, so one "
+                        "key's limit never stalls or fails a run - a file "
+                        "is still only ever sent to ONE key, never both. "
+                        "NVIDIA keys are typically much cheaper per image, "
+                        "so mixing some in lowers the average cost. Stored "
+                        "in your operating system's credential manager when "
+                        "available, otherwise in an obfuscated file only "
+                        "your user account can read.")
                   ).pack(anchor="w", pady=(px(4), px(10)))
+
+        provider_var = tk.StringVar(value="openai")
+        prov_row = ttk.Frame(body, style="Card.TFrame")
+        prov_row.pack(anchor="w", pady=(0, px(8)))
+        for pid, info in PROVIDERS.items():
+            ttk.Radiobutton(prov_row, text=info.label, value=pid,
+                            variable=provider_var,
+                            command=lambda: refresh_rows()).pack(
+                side="left", padx=(0, px(14)))
 
         self._dlg_status = ttk.Label(body, style="Muted.TLabel",
                                      wraplength=px(460), justify="left", text="")
@@ -396,23 +417,25 @@ class App:
             except Exception:                         # noqa: BLE001
                 pass
 
-        def do_test(key: str) -> None:
+        def do_test(key: str, provider: str) -> None:
             set_status("Testing %s\u2026" % mask(key))
             win.update_idletasks()
-            ok, msg = test_key(self.s, key)
+            ok, msg = test_key(self.s, key, provider=provider)
             set_status(("OK - " if ok else "Failed - ") + msg)
 
-        def do_remove(key: str) -> None:
-            remove_api_key(self.s, key)
+        def do_remove(key: str, provider: str) -> None:
+            remove_api_key(self.s, key, provider=provider)
             set_status("Removed %s." % mask(key))
             refresh_rows()
 
         def refresh_rows() -> None:
+            provider = provider_var.get()
             for w in rows.winfo_children():
                 w.destroy()
-            keys = list_api_keys(self.s)
+            keys = list_api_keys(self.s, provider)
             if not keys:
-                ttk.Label(rows, text="No keys saved yet - add at least one below.",
+                ttk.Label(rows, text="No %s keys saved yet - add one below."
+                          % PROVIDERS[provider].label,
                           style="Muted.TLabel").pack(anchor="w")
             for key in keys:
                 r = ttk.Frame(rows, style="Card.TFrame")
@@ -420,12 +443,15 @@ class App:
                 ttk.Label(r, text=mask(key), style="Card.TLabel",
                           font=t.fm(-1)).pack(side="left")
                 RoundedButton(r, text="Remove", variant="danger", theme=t,
-                              command=lambda k=key: do_remove(k)).pack(side="right")
+                              command=lambda k=key, p=provider: do_remove(k, p)
+                              ).pack(side="right")
                 RoundedButton(r, text="Test", variant="secondary", theme=t,
-                              command=lambda k=key: do_test(k)).pack(
-                    side="right", padx=(0, px(6)))
+                              command=lambda k=key, p=provider: do_test(k, p)
+                              ).pack(side="right", padx=(0, px(6)))
             count_label.configure(
-                text="%d key%s configured" % (len(keys), "" if len(keys) == 1 else "s"))
+                text="%d %s key%s configured" % (
+                    len(keys), PROVIDERS[provider].label,
+                    "" if len(keys) == 1 else "s"))
             self._refresh_key_status()
 
         count_label = ttk.Label(body, style="Field.TLabel", text="")
@@ -441,14 +467,17 @@ class App:
         entry.focus_set()
 
         def do_add() -> None:
+            provider = provider_var.get()
             key = key_var.get().strip()
             if not key:
                 set_status("Paste a key first.")
                 return
-            if not looks_like_openai_key(key):
-                set_status("That does not look like an OpenAI key "
-                           "(they start with 'sk-'). Adding it anyway.")
-            where = add_api_key(self.s, key)
+            if not looks_like_key(provider, key):
+                prefix = PROVIDERS[provider].key_prefixes[0]
+                set_status("That does not look like an %s key (they start "
+                           "with '%s'). Adding it anyway."
+                           % (PROVIDERS[provider].label, prefix))
+            where = add_api_key(self.s, key, provider=provider)
             key_var.set("")
             set_status("Added, stored in %s." % where)
             refresh_rows()
@@ -854,9 +883,13 @@ class App:
             return
         # No key? Open the key dialog instead of a dead-end "this will fail"
         # warning. The key may live in the OS keyring or the settings file,
-        # so ask secrets.resolve() rather than only the environment.
-        if self.s.engine == "openai" and not resolve(self.s)[0]:
-            self.status.configure(text="Add an OpenAI API key to continue.")
+        # so ask secrets.resolve() rather than only the environment. Either
+        # provider's key is enough - the pool draws from both (see
+        # extractor.KeyPool), there is no separate "nvidia" engine to pick.
+        if (self.s.engine == "openai"
+                and not resolve(self.s, "openai")[0]
+                and not resolve(self.s, "nvidia")[0]):
+            self.status.configure(text="Add an OpenAI or NVIDIA API key to continue.")
             self.open_api_key_dialog()
             return
         self.btn_extract.configure(state="disabled")
