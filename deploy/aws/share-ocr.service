@@ -1,5 +1,5 @@
 [Unit]
-Description=Share Certificate OCR - headless batch runner
+Description=Share Certificate OCR - authenticated browser UI
 After=network-online.target
 Wants=network-online.target
 
@@ -9,7 +9,10 @@ User=ubuntu
 WorkingDirectory=/home/ubuntu/certificateOCR
 Environment="SHARE_OCR_HOME=/home/ubuntu/.share_ocr"
 Environment="AWS_DEFAULT_REGION=ap-south-1"
-ExecStart=/home/ubuntu/certificateOCR/deploy/aws/run_with_ssm.sh run /home/ubuntu/scans --workers 8 --engine openai
+Environment="SHARE_OCR_WEB_HOST=0.0.0.0"
+Environment="SHARE_OCR_WEB_PORT=8000"
+EnvironmentFile=/home/ubuntu/.share_ocr_web.env
+ExecStart=/home/ubuntu/certificateOCR/deploy/aws/run_with_ssm.sh web
 Restart=on-failure
 RestartSec=10
 # Do not grant inbound ports for this batch worker. API keys are fetched from

@@ -1,5 +1,7 @@
 # core
 openai>=1.30.0
+flask>=3.1.0
+waitress>=3.0.0
 # Stores the API key in Windows Credential Manager / macOS Keychain /
 # Secret Service. Optional but strongly recommended - without it the key
 # falls back to an obfuscated 0600 file in the work folder.

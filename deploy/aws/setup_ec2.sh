@@ -11,7 +11,14 @@ set -euo pipefail
 
 echo "== apt packages =="
 sudo apt-get update -y
-sudo apt-get install -y python3 python3-venv python3-pip poppler-utils tmux awscli
+sudo apt-get install -y python3 python3-venv python3-pip poppler-utils tesseract-ocr tmux curl unzip
+
+echo "== AWS CLI v2 =="
+if ! command -v aws >/dev/null 2>&1; then
+    curl -fsSL "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o /tmp/awscliv2.zip
+    unzip -q -o /tmp/awscliv2.zip -d /tmp
+    sudo /tmp/aws/install
+fi
 
 echo "== python venv =="
 cd "$(dirname "$0")/../.."           # repo root
@@ -28,6 +35,10 @@ mkdir -p "${SHARE_OCR_HOME:-$HOME/.share_ocr}"
 
 echo "== systemd unit =="
 sudo install -m 0644 deploy/aws/share-ocr.service /etc/systemd/system/share-ocr.service
+if [ ! -f "$HOME/.share_ocr_web.env" ]; then
+    printf 'SHARE_OCR_WEB_PASSWORD=%s\n' "$(openssl rand -hex 24)" > "$HOME/.share_ocr_web.env"
+    chmod 600 "$HOME/.share_ocr_web.env"
+fi
 sudo systemctl daemon-reload
 
 cat <<'EOF'
@@ -53,12 +64,18 @@ Setup done. Next:
      python -m share_ocr.cli run ~/scans --workers 8 --engine openai
      # Ctrl+B then D to detach; `tmux attach -t ocr` to check back in
 
-   Or, after configuring the EC2 instance role and SSM parameters (README),
-   start the persistent service:
-     sudo systemctl enable --now share-ocr
+   The browser UI is started as a persistent service after configuring SSM
+   and the security-group port rule; see deploy/aws/README.md.
 
 4. Get the results back:
      aws s3 sync ~/.share_ocr/csv s3://your-bucket/results
      # or scp -r ubuntu@<ec2-ip>:~/.share_ocr/csv ./results
+
+Browser UI is also installed. Set an EC2 security-group inbound rule for
+TCP 8000 from your own public IP only, then start it with:
+     sudo systemctl enable --now share-ocr
+     sudo cat ~/.share_ocr_web.env   # browser login password; keep it private
+Open http://<ec2-public-ip>:8000 in your browser. SSM keys and the instance
+role are required by the service (see deploy/aws/README.md).
 
 EOF

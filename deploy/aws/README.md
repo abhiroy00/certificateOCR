@@ -1,5 +1,29 @@
 # Running this project on AWS EC2
 
+## Browser upload screen
+
+The web UI lets you upload PDFs or images, start OCR, watch queue progress,
+and download the CSV. It serves on TCP port `8000`; it does not expose the
+desktop Tkinter window. The instance role must be able to read the SSM API-key
+parameters documented below. `setup_ec2.sh` installs the UI and creates a
+random login password in `/home/ubuntu/.share_ocr_web.env` (mode 0600).
+
+After setup, add an EC2 security-group inbound rule **Custom TCP / 8000 / My
+IP**. Do not use `0.0.0.0/0`. Then open the generated password and start the
+web service:
+
+```bash
+sudo cat /home/ubuntu/.share_ocr_web.env
+sudo systemctl enable --now share-ocr
+sudo systemctl status share-ocr
+```
+
+Visit `http://13.235.100.134:8000` and sign in as `admin` with that password.
+Keep port 8000 limited to your own public IP. The simple instance URL uses
+HTTP; for use beyond a private, IP-restricted test, put the UI behind HTTPS.
+After changing web code or requirements, pull the update and rerun
+`bash deploy/aws/setup_ec2.sh`, then restart the service.
+
 ## Use the already-created Mumbai instance
 
 Instance: `i-03a4e9e2bf5b6324a` (`13.235.100.134`), region `ap-south-1`,
@@ -20,8 +44,8 @@ ssh -i $key ubuntu@13.235.100.134 "cd ~/certificateOCR && bash deploy/aws/setup_
 
 The instance needs outbound internet access for Ubuntu packages and the OCR
 API. Keep inbound access closed except SSH from your own IP (or use SSM).
-The instance type has 8 GB RAM; the supplied service starts with 8 workers.
-Upload scans to `~/scans` before starting the service.
+The instance type has 8 GB RAM; the browser UI starts with 8 workers by
+default. You choose the documents from your computer in the browser.
 
 For unattended operation, attach an EC2 instance profile that can read the
 two SecureString parameters below, then create those parameters using your
@@ -211,19 +235,13 @@ aws s3 sync ~/.share_ocr/csv s3://your-share-ocr-bucket/results
 `~/.share_ocr/csv` exactly like on Windows - `certificates-failed.csv` is
 the same failed-files sheet, `Review` is the same mostly-"No" column.
 
-## 7. Running it as a persistent service (survives reboots)
+## 7. Persistent browser service (survives reboots)
 
-```bash
-sudo cp deploy/aws/share-ocr.service /etc/systemd/system/
-sudo systemctl daemon-reload
-sudo systemctl enable --now share-ocr
-sudo systemctl status share-ocr
-journalctl -u share-ocr -f          # live log, same messages as share_ocr.log
-```
-
-`setup_ec2.sh` installs this unit file for you. It uses the SSM wrapper and
-does not store API keys in the unit. Create the SSM parameters, attach the
-instance role, and place scans in `/home/ubuntu/scans` before enabling it.
+`setup_ec2.sh` installs the unit file and creates the browser login password.
+Configure the security-group rule and SSM instance role/parameters first,
+then follow the browser UI instructions at the top of this guide. Uploaded
+files can be submitted from the browser without manually copying them into
+`/home/ubuntu/scans`.
 
 The queue is a resumable SQLite DB - a reboot or crash mid-run picks back up
 exactly where it left off (see the main README's "What makes it scale"

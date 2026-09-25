@@ -28,4 +28,9 @@ if [ -z "$OPENAI_API_KEYS" ] && [ -z "$NVIDIA_API_KEYS" ]; then
     exit 1
 fi
 
+if [ "${1:-}" = "web" ]; then
+    shift
+    exec python -m share_ocr.web "$@"
+fi
+
 exec python -m share_ocr.cli "$@"
