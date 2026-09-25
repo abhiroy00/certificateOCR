@@ -122,15 +122,28 @@ REVIEW_HEADER = next(h for h, s in CSV_SPEC if s == "@review")
 FLAGS_HEADER = next(h for h, s in CSV_SPEC if s == "validation_flags")
 EXTRACTED_AT_HEADER = next(h for h, s in CSV_SPEC if s == "@extracted_at")
 
-# The "Review" column is "Yes" only for rows with a HARD problem. These two
-# advisories are SOFT: they fire on perfectly good rows - a billed add-on the
-# certificate simply doesn't print, or a transfer log worth an eyeball - so on
-# their own they leave Review = "No". That keeps Review mostly "No", flagging
-# only rows a human genuinely needs to look at. The full text still appears in
-# the Validation Flags column either way.
-_SOFT_TRANSFER = re.compile(
-    r"Transfer history read from transfer log[^(]*\([^)]*\)")
-_SOFT_ADDON = re.compile(r"Add-on not captured:[^;]*")
+# The "Review" column is "Yes" only for rows a human really has to look at:
+#   * the file could not be read at all ("Extraction failed: ...")
+#   * a core field came back empty ("Missing company_name", ...)
+#   * the numbers contradict each other (share count vs distinctive span,
+#     a range that runs backwards) - i.e. a probable misread digit
+#   * a date that cannot be right
+#   * the folio / holder transfer histories do not line up
+# Everything below is an ADVISORY: it fires on perfectly good rows (a billed
+# add-on the certificate simply doesn't print, a transfer log worth an
+# eyeball, an unusual-but-real face value, a certificate with no distinctive
+# numbers, a second scan of a certificate already extracted) - on their own
+# they leave Review = "No", so Review stays mostly "No" and "Yes" really
+# means "check this one". The full text of every flag, advisory or not, is
+# still in the Validation Flags column.
+_SOFT_FLAG_PATTERNS = [re.compile(p) for p in (
+    r"Transfer history read from transfer log[^(]*\([^)]*\)",
+    r"Add-on not captured:[^;]*",
+    r"Unusual face value \([^)]*\)[^;]*",
+    r"Face value looks like the share count",
+    r"Distinctive numbers missing/unreadable",
+    r"Possible duplicate: same certificate also extracted from [^;]*",
+)]
 
 
 def review_verdict(validation_flags) -> str:
@@ -138,8 +151,8 @@ def review_verdict(validation_flags) -> str:
     s = (validation_flags or "").strip()
     if not s:
         return "No"
-    s = _SOFT_TRANSFER.sub("", s)
-    s = _SOFT_ADDON.sub("", s)
+    for pat in _SOFT_FLAG_PATTERNS:
+        s = pat.sub("", s)
     # Anything with letters still standing is a hard flag.
     return "Yes" if re.search(r"[A-Za-z]", s) else "No"
 
@@ -335,7 +348,11 @@ class Settings:
     tesseract_cmd: str = os.environ.get("TESSERACT_CMD", "")
 
     # --- scale knobs ------------------------------------------------------
-    workers: int = int(os.environ.get("SHARE_OCR_WORKERS", "8"))
+    workers: int = int(os.environ.get("SHARE_OCR_WORKERS", "8"))   # floor
+    # With the API engine the run automatically uses MORE workers as more
+    # keys are added (see extractor.suggested_workers) - each key is its own
+    # rate-limit budget - up to this ceiling.
+    max_workers: int = int(os.environ.get("SHARE_OCR_MAX_WORKERS", "64"))
     claim_batch: int = 200          # rows a worker pulls from the queue at once
     csv_flush_rows: int = 500       # rows buffered before fsync of the CSV shard
     csv_shard_rows: int = 200_000   # new CSV part file after this many rows

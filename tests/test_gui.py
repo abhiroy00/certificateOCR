@@ -395,6 +395,27 @@ def main() -> int:
         check("an unknown iid resolves to nothing",
               app._row_source_path("I999") is None)
 
+        # ------------------------------------ failed-files report ------
+        print("\n[8e] Output folder makes sure a failed-files Excel is there")
+        from share_ocr.csv_writer import FAILED_REPORT_NAME
+        report = Path(s.csv_dir) / FAILED_REPORT_NAME
+        check("no report while nothing has failed", not report.exists())
+        broken = imgs / "broken_scan.jpg"
+        broken.write_bytes(b"not really a jpeg")
+        app.pipeline.q.add_files([(str(broken), broken.name, 17)], "gui-test")
+        fid = app.pipeline.q.conn.execute(
+            "SELECT id FROM files WHERE name=?", (broken.name,)).fetchone()[0]
+        app.pipeline.q.mark_failed(fid, "APITimeoutError: Request timed out.", 1)
+        opened_paths = []
+        app._open_path = lambda pth: (opened_paths.append(pth), True)[1]
+        app._open_output()
+        check("clicking Output folder still opens the folder",
+              opened_paths == [str(s.csv_dir)], opened_paths)
+        txt = report.read_text("utf-8-sig") if report.exists() else ""
+        check("and the failed-files sheet is in it, listing the failure",
+              "broken_scan.jpg" in txt and "Request timed out" in txt, txt[:200])
+        app.pipeline.q.conn.execute("DELETE FROM files WHERE id=?", (fid,))
+
         # ------------------------------------------------- clear all ----
         print("\n[9] clear all")
         fake_tk.DIALOGS.reset()

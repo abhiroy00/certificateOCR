@@ -16,6 +16,7 @@ import base64
 import io
 import json
 import os
+import random
 import re
 import shutil
 import tempfile
@@ -174,6 +175,9 @@ class BaseEngine:
 
     def __init__(self, settings: Settings):
         self.s = settings
+        # Set by the pipeline to its stop flag, so an engine sleeping through
+        # an API rate limit gives up promptly when the operator presses Stop.
+        self.should_stop = lambda: False
 
     def extract_image(self, image_path: str) -> Dict:  # pragma: no cover
         raise NotImplementedError
@@ -393,6 +397,42 @@ def _parse_json_response(content: Optional[str]) -> dict:
         raise
 
 
+# Threads to run per key. Each key is its own rate-limit budget, so the
+# useful amount of parallelism grows with how many keys are configured. NVIDIA's
+# hosted endpoint answered slowly / timed out under concurrent load on a free
+# key, so it gets fewer per key than OpenAI.
+WORKERS_PER_KEY = {"openai": 12, "nvidia": 6}
+
+
+def suggested_workers(settings: Settings) -> int:
+    """How many concurrent workers the configured key pool can usefully
+    feed (Pipeline._effective_workers caps and floors this)."""
+    return sum(WORKERS_PER_KEY.get(e.provider, 8) for e in _pool_entries(settings))
+
+
+_RETRY_AFTER_RE = re.compile(r"try again in\s*([\d.]+)\s*(ms|s|m)\b", re.IGNORECASE)
+
+
+def rate_limit_wait_hint(exc: BaseException) -> Optional[float]:
+    """Seconds an API rate limit says to wait ("Please try again in 519ms"),
+    or None if `exc` is not a transient throttle at all.
+
+    Out-of-credits is NOT transient (waiting never fixes billing), nor is a
+    bad key - those return None. A throttle with no stated wait returns 0.0,
+    meaning "transient, use your own backoff"."""
+    msg = str(exc).lower()
+    if is_quota_exhausted(msg):
+        return None
+    if not any(s in msg for s in ("rate limit", "429", "too many requests",
+                                  "overloaded", "503", "502")):
+        return None
+    m = _RETRY_AFTER_RE.search(msg)
+    if not m:
+        return 0.0
+    value, unit = float(m.group(1)), m.group(2).lower()
+    return value / 1000.0 if unit == "ms" else value * 60.0 if unit == "m" else value
+
+
 class OpenAIEngine(BaseEngine):
     name = "openai"
 
@@ -413,6 +453,14 @@ class OpenAIEngine(BaseEngine):
     # keys could make a whole bulk run crawl. Parking it for a bit lets
     # healthy keys carry the load while this one gets a chance to recover.
     TIMEOUT_COOLDOWN_S = 45.0
+    # When every key in the pool answers "slow down" (a per-minute token/
+    # request limit - the normal ceiling of a paid account under a bulk run),
+    # the right response is to wait a moment and go again, NOT to fail the
+    # file: each failed attempt used to count toward max_attempts, so a bulk
+    # run on one busy key steadily dead-lettered perfectly good files.
+    # Waiting here is what makes the run settle at exactly the speed the
+    # account allows. Gives up (raises, as before) after this many seconds.
+    THROTTLE_MAX_WAIT_S = 120.0
 
     def __init__(self, settings: Settings):
         super().__init__(settings)
@@ -445,7 +493,35 @@ class OpenAIEngine(BaseEngine):
                     self._clients[ident] = client
         return client
 
+    def _sleep_unless_stopped(self, seconds: float) -> None:
+        end = time.time() + seconds
+        while time.time() < end and not self.should_stop():
+            time.sleep(min(0.25, max(0.0, end - time.time())))
+
     def _complete(self, messages: List[Dict]) -> Dict:
+        """One extraction request. If every key in the pool is being
+        throttled (a transient per-minute rate limit), wait as long as the
+        API asks and go again - up to THROTTLE_MAX_WAIT_S - instead of
+        failing the file. Anything else propagates unchanged."""
+        waited = 0.0
+        pause = 0.5
+        while True:
+            try:
+                return self._complete_round(messages)
+            except Exception as e:                          # noqa: BLE001
+                hint = rate_limit_wait_hint(e)
+                if (hint is None or self.should_stop()
+                        or waited >= self.THROTTLE_MAX_WAIT_S):
+                    raise
+                # honour the API's own "try again in Xs", else back off; add
+                # jitter so a crowd of workers doesn't retry in lock-step
+                wait = max(hint, pause) * (1.0 + random.random() * 0.5)
+                wait = min(wait, 20.0, self.THROTTLE_MAX_WAIT_S - waited)
+                self._sleep_unless_stopped(wait)
+                waited += wait
+                pause = min(pause * 2, 15.0)
+
+    def _complete_round(self, messages: List[Dict]) -> Dict:
         """Call chat.completions, trying every key in the pool (healthiest
         first, OpenAI and NVIDIA keys mixed together) before giving up. Only
         ONE of them ever actually answers - the loop returns on the first
@@ -486,7 +562,13 @@ class OpenAIEngine(BaseEngine):
                     continue
                 if any(s in msg for s in ("rate limit", "429", "overloaded",
                                           "503", "502")):
-                    self.pool.cooldown(pk.identity, self.RATE_LIMIT_COOLDOWN_S)
+                    # a limit that says "try again in 519ms" needs a ~1s
+                    # breather, not the flat 30s that used to park a key
+                    # (and pile everything onto the others) for no reason
+                    hint = rate_limit_wait_hint(e) or 0.0
+                    cool = (min(self.RATE_LIMIT_COOLDOWN_S, max(1.0, hint * 2))
+                            if hint else self.RATE_LIMIT_COOLDOWN_S)
+                    self.pool.cooldown(pk.identity, cool)
                     continue
                 if any(s in msg for s in ("401", "invalid_api_key",
                                           "incorrect api key", "account_deactivated")):

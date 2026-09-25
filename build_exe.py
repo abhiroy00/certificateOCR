@@ -69,8 +69,14 @@ def main() -> int:
     # NOT in this list any more - the GUI's "Download Excel" button
     # (csv_writer.merge_into_excel) imports it for real now, so excluding
     # it would make that button silently break in the shipped exe.
+    # botocore/boto3/cryptography are the same story: nothing in this app
+    # imports them, but a build machine that happens to have them installed
+    # (via unrelated tools) gets ~2,000 extra files / ~20 MB bundled through
+    # some library's optional import. A lean bundle is closer to the exe that
+    # is known to run well on client machines.
     for mod in ("numpy", "pandas", "numba", "llvmlite", "sqlalchemy",
-                "psycopg2", "opentelemetry"):
+                "psycopg2", "opentelemetry", "botocore", "boto3", "s3transfer",
+                "cryptography"):
         cmd += ["--exclude-module", mod]
     cmd += ["--hidden-import", "openpyxl"]
     if ICON.exists():
@@ -82,6 +88,10 @@ def main() -> int:
         print("WARNING: smtp_config.json not found - the built exe will not "
               "be able to send OTP codes. See README.md "
               "'Configuring the OTP sender'.")
+    # Extra arguments are handed straight to PyInstaller, e.g. to build into a
+    # separate folder without touching an existing dist/:
+    #     python build_exe.py --distpath dist_v2 --workpath build_v2
+    cmd += sys.argv[1:]
     cmd.append(str(ROOT / "run_gui.py"))
 
     print(" ".join(cmd))

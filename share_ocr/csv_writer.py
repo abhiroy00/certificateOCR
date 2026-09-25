@@ -14,6 +14,7 @@ one file, one CSV, everything in it.
 from __future__ import annotations
 
 import csv
+import os
 import re
 import threading
 from datetime import datetime, timezone
@@ -350,3 +351,56 @@ def failed_file_row(name: str, source_path: Optional[str], error: str) -> Dict:
     row[FLAGS_HEADER] = "Extraction failed: " + " ".join(str(error).split())
     row[EXTRACTED_AT_HEADER] = datetime.now(timezone.utc).isoformat(timespec="seconds")
     return row
+
+
+# ------------------------------------------------- failed-files report ------
+# A separate, always-current list of every file that could not be extracted,
+# written next to the result shards so it is right there when the operator
+# clicks "Output folder". The main CSV is untouched - a file that finally gave
+# up still gets its blank Review=Yes placeholder row there (failed_file_row);
+# this is the same information in one place, with the reason, attempt count
+# and time, ready to hand to whoever re-scans or re-runs those files.
+FAILED_REPORT_NAME = "certificates-failed.csv"
+FAILED_REPORT_COLUMNS = ["File name", "Status", "Reason", "Attempts",
+                         "Failed at", "File path"]
+
+
+def write_failed_report(dest: Path, failures, max_attempts: int) -> int:
+    """(Re)write the failed-files report from the queue's failed/dead rows
+    and return how many files it lists. Written to a temp file and swapped
+    in, so a reader never sees a half-written report. With nothing failed
+    there is nothing to report - an old report is removed instead of being
+    left behind listing files that have since succeeded.
+
+    Raises PermissionError/OSError if the report is open in Excel (Windows
+    locks it) - the caller retries later rather than losing the update."""
+    rows = sorted(failures, key=lambda r: str(r["name"]).lower())
+    dest = Path(dest)
+    if not rows:
+        try:
+            dest.unlink()
+        except FileNotFoundError:
+            pass
+        return 0
+    tmp = dest.with_name(dest.name + ".tmp")
+    with tmp.open("w", encoding="utf-8-sig", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(FAILED_REPORT_COLUMNS)
+        for r in rows:
+            gave_up = r["status"] == "dead"
+            status = (f"Failed - gave up after {r['attempts']} attempt(s)"
+                      if gave_up else "Failed - will retry on next Extract")
+            when = ""
+            if r["updated_at"]:
+                when = datetime.fromtimestamp(
+                    r["updated_at"], timezone.utc).isoformat(timespec="seconds")
+            w.writerow([
+                hyperlink_cell(r["path"], r["name"]),
+                status,
+                " ".join(str(r["error"] or "").split()),
+                f"{r['attempts']}/{max_attempts}",
+                when,
+                r["path"],
+            ])
+    os.replace(tmp, dest)
+    return len(rows)

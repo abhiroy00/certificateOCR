@@ -58,6 +58,8 @@ python -m share_ocr.cli retry       # requeue failures
 python -m share_ocr.cli export /out/certificates.csv
 ```
 
+**Running this on AWS EC2** (24/7, no laptop needed): see `deploy/aws/README.md` - same CLI, same pipeline, nothing about the OCR logic changes, an OpenAI/NVIDIA API key is still required either way.
+
 **Horizontal scaling:** put `~/.share_ocr/queue.db` on shared storage (or set
 `SHARE_OCR_HOME`) and run `cli run` on as many machines as you like — claims are
 atomic, so no image is processed twice.
@@ -90,6 +92,35 @@ face_value_per_share, remarks, distinctive_from, distinctive_to, date_of_issue,
 validation_flags, engine, model, latency_ms, extracted_at`
 
 CSV is written as UTF-8-BOM so Excel opens Indian names correctly.
+
+**Failed files get their own sheet.** Whenever a file could not be extracted,
+`certificates-failed.csv` is written next to the result shards - so it is right
+there when you click **Output folder** - listing File name (clickable), Status,
+Reason, Attempts and Failed at. It refreshes while a run is going, at the end of
+every run, and each time you click Output folder; once those files succeed (e.g.
+after **Retry failed**) it is removed. If it is open in Excel the update is
+retried automatically. The main CSV is unchanged: a file that gave up still has
+its blank `Review = Yes` placeholder row there.
+
+**Review is mostly "No".** `Review = Yes` only when a row really needs a human:
+the file could not be read, a core field (company, certificate no, holder, share
+count) is empty, the numbers contradict each other (share count vs distinctive
+span, a range that runs backwards), a date cannot be right, or the folio/holder
+histories do not line up. Advisory flags - unusual face value, no distinctive
+numbers, add-on not printed, transfer log worth an eyeball, a second scan of a
+certificate already extracted - leave it `No`; their text is still in
+**Validation Flags**.
+
+**Built for tens of thousands of files.** Selecting 80,000 files works (the run's
+file list lives in a DB table, not SQL parameters). With the OpenAI/NVIDIA engine
+the run uses more worker threads as you add keys (12 per OpenAI key, 6 per NVIDIA
+key, up to `max_workers` = 64; `workers` is the floor), requests are spread
+round-robin across all keys, and workers take small claims so none sits on a
+private backlog while the rest idle. A per-minute rate limit is waited out and
+the request retried (following the API's "try again in ..." hint) instead of
+counting as a failed attempt; running out of credits is not waited on. Keys from
+the SAME OpenAI organisation share one rate limit - for more throughput, add keys
+from different accounts.
 
 **Source File is a clickable link.** That column is written as an Excel
 `HYPERLINK()` formula pointing at the scan's absolute path on disk, with the

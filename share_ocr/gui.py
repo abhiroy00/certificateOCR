@@ -1042,6 +1042,7 @@ class App:
                       f"({c['done']:,} done, {c['pending']:,} pending). "
                       "Press Extract to continue."))
             self._reload_table()
+        self._refresh_failed_report()
 
     def _reload_table(self) -> None:
         self.tree.delete(*self.tree.get_children())
@@ -1138,7 +1139,19 @@ class App:
         except Exception:                             # noqa: BLE001
             return False
 
+    def _refresh_failed_report(self) -> None:
+        """Bring certificates-failed.csv up to date with the queue. Never
+        allowed to get in the way of what the caller is doing."""
+        try:
+            self.pipeline.export_failed_report()
+        except Exception:                                   # noqa: BLE001
+            pass
+
     def _open_output(self) -> None:
+        # The failed-files list lives in the output folder next to the result
+        # shards - refresh it first so what opens is current, whether the
+        # failures happened this session or in an earlier one.
+        self._refresh_failed_report()
         path = str(self.s.csv_dir)
         if not self._open_path(path):
             messagebox.showinfo(APP_NAME, path)

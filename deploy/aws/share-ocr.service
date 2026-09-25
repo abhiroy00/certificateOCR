@@ -1,0 +1,23 @@
+[Unit]
+Description=Share Certificate OCR - headless batch runner
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/certificateOCR
+Environment="SHARE_OCR_HOME=/home/ubuntu/.share_ocr"
+Environment="AWS_DEFAULT_REGION=ap-south-1"
+ExecStart=/home/ubuntu/certificateOCR/deploy/aws/run_with_ssm.sh run /home/ubuntu/scans --workers 8 --engine openai
+Restart=on-failure
+RestartSec=10
+# Do not grant inbound ports for this batch worker. API keys are fetched from
+# SSM at launch; the EC2 instance profile needs ssm:GetParameter access.
+NoNewPrivileges=true
+PrivateTmp=true
+# The pipeline itself is resumable (SQLite queue) - a restart after a crash
+# or reboot picks up exactly where it left off, nothing is redone or lost.
+
+[Install]
+WantedBy=multi-user.target

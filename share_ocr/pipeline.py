@@ -27,8 +27,10 @@ from typing import Callable, Dict, Iterator, List, Optional, Tuple
 
 from . import db
 from .config import SUPPORTED_EXT, Settings
-from .csv_writer import ShardedCsvWriter, failed_file_row, record_to_row
-from .extractor import build_engine, is_quota_exhausted, validate
+from .csv_writer import (FAILED_REPORT_NAME, ShardedCsvWriter,
+                         failed_file_row, record_to_row, write_failed_report)
+from .extractor import (build_engine, is_quota_exhausted, suggested_workers,
+                        validate)
 
 log = logging.getLogger("share_ocr")
 
@@ -123,6 +125,10 @@ class Pipeline:
         self._engine_lock = threading.Lock()
         self._scope_ids: Optional[List[int]] = None
         self._claim_batch = settings.claim_batch   # start() recomputes a fair share
+        # failed-files report (see export_failed_report)
+        self._failed_dirty = False
+        self._failed_exported_at = 0.0
+        self._failed_lock = threading.Lock()
 
     # ---------------------------------------------------------- ingest --
     def ingest(self, roots: List[str], batch: Optional[str] = None) -> int:
@@ -151,6 +157,9 @@ class Pipeline:
         if eng is None:
             with self._engine_lock:
                 eng = build_engine(self.s)
+                # lets an engine that is waiting out an API rate limit notice
+                # Stop straight away instead of finishing its wait first
+                eng.should_stop = self._stop.is_set
                 self._engines[tid] = eng
         return eng
 
@@ -179,6 +188,9 @@ class Pipeline:
         with self._engine_lock:
             self._engines.clear()
         self._scope_ids = list(scope_ids) if scope_ids is not None else None
+        # Staged in the DB (not bound as SQL parameters) so a selection of
+        # tens of thousands of files works - see db.run_scope.
+        self.q.set_scope(self._scope_ids)
         self.q.requeue_stale()
         c = self.q.counts_for(self._scope_ids) if self._scope_ids is not None else self.q.counts()
         self.stats = Stats(total=c["total"], done=c[db.DONE], failed=c[db.DEAD])
@@ -195,18 +207,46 @@ class Pipeline:
         # lets multiple files - and therefore multiple keys, including
         # NVIDIA ones - run side by side instead of one worker grinding
         # through everything alone.
+        n_workers = self._effective_workers()
         remaining = c.get(db.PENDING, 0) + c.get(db.FAILED, 0)
+        # For the API engine every file takes seconds, so a worker holding a
+        # big private batch is the problem, not the fix: whoever draws the
+        # short straw is still grinding through its 200 while everyone else
+        # sits idle at the end of the run. Small claims keep all workers busy
+        # right to the last file, and a claim is one cheap indexed query, so
+        # the extra round-trips cost nothing next to an API call. The large
+        # claim_batch stays for the offline engine, where files are fast.
+        cap = 10 if self.s.engine == "openai" else self.s.claim_batch
         self._claim_batch = max(1, min(
-            self.s.claim_batch,
-            -(-remaining // max(1, self.s.workers))))   # ceil(remaining / workers)
+            self.s.claim_batch, cap,
+            -(-remaining // n_workers)))                # ceil(remaining / workers)
         self._threads = [
             threading.Thread(target=self._worker, args=(i,), daemon=True,
                              name=f"ocr-{i}")
-            for i in range(self.s.workers)
+            for i in range(n_workers)
         ]
         for t in self._threads:
             t.start()
         threading.Thread(target=self._reporter, daemon=True, name="reporter").start()
+
+    def _effective_workers(self) -> int:
+        """How many worker threads this run uses.
+
+        `workers` is the floor. For the API engine the useful amount of
+        parallelism grows with the number of keys in the pool (each key is
+        its own rate-limit budget, and requests are spread across all of
+        them - see extractor.KeyPool), so add keys and the run gets more
+        concurrent workers automatically, up to `max_workers`. Threads are
+        the right tool here: each one spends nearly all its time waiting on
+        the network, which releases the GIL."""
+        base = max(1, self.s.workers)
+        if self.s.engine != "openai":
+            return base
+        try:
+            want = suggested_workers(self.s)
+        except Exception:                                   # noqa: BLE001
+            want = 0
+        return max(1, min(self.s.max_workers, max(base, want)))
 
     def stop(self) -> None:
         self._stop.set()
@@ -218,6 +258,12 @@ class Pipeline:
         for t in self._threads:
             t.join()
         self._drain_flush()
+        # final, exact list (also drops files that failed earlier in this run
+        # but succeeded on a later attempt)
+        for _ in range(5):
+            if self.export_failed_report() is not False:
+                break
+            time.sleep(1.0)
 
     @property
     def running(self) -> bool:
@@ -231,7 +277,7 @@ class Pipeline:
             while self._pause.is_set() and not self._stop.is_set():
                 time.sleep(0.25)
             rows = q.claim(self._claim_batch, worker=f"w{idx}",
-                          scope_ids=self._scope_ids)
+                          use_scope=self._scope_ids is not None)
             if not rows:
                 # DUPLICATE-ROW BUG (fixed): the old code probed for work with
                 # `q.claim(1)` and threw the result away. That row was already
@@ -288,6 +334,7 @@ class Pipeline:
                        "settings/organization/billing, then click Retry "
                        f"failed. ({err})")
             status = q.mark_failed(file_id, err, self.s.max_attempts)
+            self._failed_dirty = True          # refresh certificates-failed.csv
             if status == db.DEAD:
                 self.stats.bump(failed=1)
                 # Give up for good: record it as a blank placeholder row in
@@ -352,6 +399,8 @@ class Pipeline:
     def _reporter(self) -> None:
         while not self._stop.is_set() and self.running:
             self._safe_flush()
+            if self._failed_dirty and time.time() - self._failed_exported_at >= 3.0:
+                self.export_failed_report()
             if self.on_progress:
                 self.on_progress(self.stats)
             time.sleep(1.0)
@@ -382,6 +431,34 @@ class Pipeline:
             if self.csv.pending() == 0:
                 return
             time.sleep(delay)
+
+    # ---------------------------------------------- failed-files report --
+    @property
+    def failed_report_path(self) -> Path:
+        return Path(self.s.csv_dir) / FAILED_REPORT_NAME
+
+    def export_failed_report(self) -> Optional[bool]:
+        """Rewrite certificates-failed.csv (next to the result shards, so
+        it is right there behind the toolbar's "Output folder" button) from
+        the queue's failed/dead files. Returns True if written (or removed,
+        when nothing has failed), False if it could not be - typically
+        because the report is open in Excel, which locks it on Windows; it
+        stays marked dirty and is retried, so nothing is lost."""
+        with self._failed_lock:
+            try:
+                rows = self.q.failures(10_000_000)
+                write_failed_report(self.failed_report_path, rows,
+                                    self.s.max_attempts)
+            except OSError as e:
+                self._failed_dirty = True
+                self.on_log(f"WARN: could not update {FAILED_REPORT_NAME} "
+                            f"({type(e).__name__}: {e}) - close it if it is "
+                            "open in Excel. It updates automatically once "
+                            "the file is free again.")
+                return False
+            self._failed_dirty = False
+            self._failed_exported_at = time.time()
+            return True
 
     # ----------------------------------------------------------- misc --
     def counts(self) -> Dict[str, int]:

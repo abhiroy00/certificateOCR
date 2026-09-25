@@ -18,6 +18,7 @@ SUITES = [
     ("OTP access gate logic", "tests.test_otp_auth"),
     ("OTP sign-in screen (headless)", "tests.test_login_gate"),
     ("API key pool / error classification", "tests.test_extractor"),
+    ("80k scale / failed report / Review", "tests.test_scale_and_failed"),
 ]
 
 

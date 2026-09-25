@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import logging
+import random
 import sqlite3
 import threading
 import time
@@ -49,6 +50,14 @@ CREATE TABLE IF NOT EXISTS files (
 );
 CREATE INDEX IF NOT EXISTS idx_files_status ON files(status, id);
 CREATE INDEX IF NOT EXISTS idx_files_batch  ON files(batch);
+
+-- The file ids the CURRENT run is allowed to claim (the GUI's Extract only
+-- processes what the operator selected). Kept in a table, not passed as
+-- "id IN (?,?,...)": SQLite rejects a statement with more than ~32k bound
+-- parameters, so selecting 80,000 files made Extract fail outright with
+-- "too many SQL variables" - and even below that limit, rebuilding a
+-- many-thousand-placeholder query on every claim() is needlessly slow.
+CREATE TABLE IF NOT EXISTS run_scope (id INTEGER PRIMARY KEY);
 
 CREATE TABLE IF NOT EXISTS results (
     row_id     INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -148,7 +157,9 @@ class Queue:
                     raise
                 log.warning("database busy (attempt %d/%d), retrying in %.1fs: %s",
                            attempt + 1, attempts, delay, e)
-                time.sleep(delay)
+                # jitter: with dozens of workers, identical delays make them
+                # all wake up and collide again at the same instant
+                time.sleep(delay * (0.5 + random.random()))
                 delay *= 2
         raise AssertionError("unreachable")   # pragma: no cover
 
@@ -202,8 +213,25 @@ class Queue:
         return cls._retry_locked(conn, _txn)
 
     # ----------------------------------------------------------- claim --
+    def set_scope(self, ids: Optional[Sequence[int]]) -> None:
+        """Stage the file ids this run may claim (see the run_scope table).
+        None / empty clears it. Replaces whatever the previous run staged."""
+        conn = self.conn
+        ids = list(ids) if ids else []
+
+        def _txn() -> None:
+            cur = conn.cursor()
+            cur.execute("BEGIN")
+            cur.execute("DELETE FROM run_scope")
+            for i in range(0, len(ids), 20_000):
+                cur.executemany("INSERT OR IGNORE INTO run_scope(id) VALUES(?)",
+                                ((x,) for x in ids[i:i + 20_000]))
+            cur.execute("COMMIT")
+        self._retry_locked(conn, _txn)
+
     def claim(self, limit: int, worker: str,
-              scope_ids: Optional[Sequence[int]] = None) -> List[sqlite3.Row]:
+              scope_ids: Optional[Sequence[int]] = None,
+              use_scope: bool = False) -> List[sqlite3.Row]:
         """Atomically move up to `limit` pending rows to running.
 
         `scope_ids`, when given, restricts the claim to those file ids only
@@ -212,8 +240,14 @@ class Queue:
         headless CLI never passes it, so the full resumable-queue behaviour
         for the 30-lakh job is unchanged.
         """
-        if scope_ids is not None and not scope_ids:
+        if use_scope:
+            pass                     # ids come from the run_scope table
+        elif scope_ids is not None and not scope_ids:
             return []
+        elif scope_ids is not None and len(scope_ids) > 900:
+            # Too many for bound parameters - stage them and use the table.
+            self.set_scope(scope_ids)
+            use_scope = True
         with self._claim_lock:
             conn = self.conn
             conn.row_factory = sqlite3.Row
@@ -221,7 +255,13 @@ class Queue:
             def _txn() -> List[sqlite3.Row]:
                 cur = conn.cursor()
                 cur.execute("BEGIN IMMEDIATE")
-                if scope_ids is not None:
+                if use_scope:
+                    rows = cur.execute(
+                        "SELECT f.id, f.path, f.name FROM files f"
+                        " JOIN run_scope s ON s.id = f.id"
+                        " WHERE f.status IN ('pending','failed')"
+                        " ORDER BY f.id LIMIT ?", (limit,)).fetchall()
+                elif scope_ids is not None:
                     qs = ",".join("?" * len(scope_ids))
                     rows = cur.execute(
                         f"SELECT id, path, name FROM files"
@@ -453,7 +493,7 @@ class Queue:
     def failures(self, limit: int = 500) -> List[sqlite3.Row]:
         self.conn.row_factory = sqlite3.Row
         return self.conn.execute(
-            "SELECT id, name, path, attempts, error FROM files"
+            "SELECT id, name, path, attempts, error, status, updated_at FROM files"
             " WHERE status IN ('failed','dead') ORDER BY updated_at DESC LIMIT ?",
             (limit,),
         ).fetchall()
