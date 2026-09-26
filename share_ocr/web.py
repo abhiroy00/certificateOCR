@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import hmac
+import json
 import os
 import secrets
 import threading
@@ -10,12 +11,13 @@ import uuid
 from pathlib import Path
 from datetime import timedelta
 
-from flask import (Flask, abort, jsonify, request, send_file,
-                   session)
+from flask import (Flask, abort, jsonify, request, send_file, session,
+                   url_for)
 from waitress import serve
 from werkzeug.utils import secure_filename
 
 from .config import SUPPORTED_EXT, Settings
+from . import db
 from .otp_auth import (MAX_ATTEMPTS, OTP_TTL_SECONDS,
                        RESEND_COOLDOWN_SECONDS, OtpChallenge, OtpMailError,
                        generate_otp, is_valid_email, send_otp_email)
@@ -140,6 +142,72 @@ def status():
                     "files": files})
 
 
+@app.get("/api/rows")
+def rows():
+    """Return the same extracted fields shown in the desktop results table."""
+    s = Settings.load()
+    q = db.Queue(s.db_path)
+    try:
+        found = q.recent_rows(2000)
+        output = []
+        for row in reversed(found):
+            try:
+                rec = json.loads(row["payload"])
+            except (TypeError, json.JSONDecodeError):
+                rec = {}
+            distinctive = ""
+            if rec.get("distinctive_from") or rec.get("distinctive_to"):
+                distinctive = f'{rec.get("distinctive_from", "")} - {rec.get("distinctive_to", "")}'
+            output.append({
+                "idx": len(output) + 1,
+                "file": row["name"],
+                "file_url": url_for("source_file", row_id=row["row_id"]),
+                "company": rec.get("company_name", ""),
+                "folio": rec.get("folio_no", ""),
+                "regfolio": rec.get("registered_folio_no", ""),
+                "cert": rec.get("certificate_no", ""),
+                "holder": rec.get("share_holder_name", ""),
+                "shares": rec.get("no_of_shares", ""),
+                "facevalue": rec.get("face_value_per_share", ""),
+                "sharetype": rec.get("share_type", ""),
+                "distinctive": distinctive,
+                "date": rec.get("date_of_issue", ""),
+                "latest": rec.get("latest_share_holder_name", ""),
+                "latestfolio": rec.get("latest_folio_no", ""),
+                "foliohistory": rec.get("folio_no_history", ""),
+                "holderhistory": rec.get("share_holder_history", ""),
+                "remarks": rec.get("remarks", ""),
+                "flags": rec.get("validation_flags", ""),
+            })
+        return jsonify({"rows": output, "total": len(output)})
+    finally:
+        q.close()
+
+
+@app.get("/api/source/<int:row_id>")
+def source_file(row_id: int):
+    """Open the uploaded scan linked from a result row."""
+    s = Settings.load()
+    q = db.Queue(s.db_path)
+    try:
+        row = q.conn.execute(
+            "SELECT f.path, f.name FROM results r JOIN files f ON f.id=r.file_id "
+            "WHERE r.row_id=?", (row_id,)).fetchone()
+    finally:
+        q.close()
+    if not row:
+        abort(404)
+    path = Path(row[0]).resolve()
+    uploads_root = (Path.home() / "scans" / "uploads").resolve()
+    try:
+        path.relative_to(uploads_root)
+    except ValueError:
+        abort(404)
+    if not path.is_file():
+        abort(404)
+    return send_file(path, as_attachment=False, download_name=row[1])
+
+
 @app.post("/api/run")
 def run_job():
     if not _csrf_ok():
@@ -229,11 +297,12 @@ PAGE = r'''<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="csrf-token" content="__CSRF__"><title>Share Certificate OCR</title>
 <style>
-*{box-sizing:border-box}body{margin:0;background:#f3f6fb;color:#152238;font:16px system-ui,Segoe UI,sans-serif}.wrap{max-width:900px;margin:48px auto;padding:0 20px}.brand{color:#2864dc;font-weight:700;letter-spacing:.08em;font-size:13px}.card{background:#fff;border:1px solid #e3e9f2;border-radius:18px;padding:26px;margin-top:20px;box-shadow:0 8px 30px #182a4710}h1{font-size:32px;margin:8px 0}p{color:#63718a}.drop{border:2px dashed #b8c7dc;border-radius:14px;padding:36px 18px;text-align:center;background:#f9fbff;cursor:pointer}.drop:hover{border-color:#2864dc}.controls{display:flex;gap:16px;align-items:end;flex-wrap:wrap;margin-top:18px}label{display:grid;gap:7px;color:#52627b;font-size:14px}select,input[type=number]{padding:10px;border:1px solid #ccd6e4;border-radius:9px;background:white;color:#152238}button{border:0;border-radius:10px;background:#2864dc;color:white;font-weight:650;padding:12px 20px;cursor:pointer}button:disabled{opacity:.55;cursor:wait}.muted{color:#75839a;font-size:13px}.bar{height:10px;border-radius:9px;background:#e7edf6;overflow:hidden}.fill{height:100%;width:0;background:#2864dc;transition:width .3s}.row{display:flex;justify-content:space-between;gap:16px;align-items:center}.pill{border-radius:99px;padding:5px 11px;background:#edf2fa;font-size:13px;text-transform:capitalize}.files a{display:inline-block;margin:8px 10px 0 0;color:#2864dc}.error{color:#b42318}.ok{color:#147d50}@media(max-width:600px){.wrap{margin:20px auto}.card{padding:19px}h1{font-size:27px}}
+*{box-sizing:border-box}body{margin:0;background:#f3f6fb;color:#152238;font:16px system-ui,Segoe UI,sans-serif}.wrap{max-width:1500px;margin:32px auto;padding:0 20px}.brand{color:#2864dc;font-weight:700;letter-spacing:.08em;font-size:13px}.card{background:#fff;border:1px solid #e3e9f2;border-radius:14px;padding:22px;margin-top:16px;box-shadow:0 8px 30px #182a4710}h1{font-size:32px;margin:8px 0}p{color:#63718a}.drop{border:2px dashed #b8c7dc;border-radius:10px;padding:30px 18px;text-align:center;background:#f9fbff;cursor:pointer}.drop:hover{border-color:#2864dc}.controls{display:flex;gap:14px;align-items:end;flex-wrap:wrap;margin-top:16px}label{display:grid;gap:7px;color:#52627b;font-size:14px}select,input[type=number]{padding:10px;border:1px solid #ccd6e4;border-radius:9px;background:white;color:#152238}button{border:0;border-radius:9px;background:#2864dc;color:white;font-weight:650;padding:12px 20px;cursor:pointer}button:disabled{opacity:.55;cursor:wait}.muted{color:#75839a;font-size:13px}.bar{height:10px;border-radius:9px;background:#e7edf6;overflow:hidden}.fill{height:100%;width:0;background:#2864dc;transition:width .3s}.row{display:flex;justify-content:space-between;gap:16px;align-items:center}.pill{border-radius:99px;padding:5px 11px;background:#edf2fa;font-size:13px;text-transform:capitalize}.files a{display:inline-block;margin:8px 10px 0 0;color:#2864dc}.error{color:#b42318}.ok{color:#147d50}.table-wrap{overflow:auto;max-height:62vh;border:1px solid #d8e0ec;margin-top:14px}table{border-collapse:collapse;min-width:1850px;width:100%;font-size:13px}th{position:sticky;top:0;background:#f4f7fb;z-index:1;text-align:left;white-space:nowrap;color:#43536b}th,td{padding:9px 10px;border-bottom:1px solid #e6ebf2;vertical-align:top}td{max-width:260px;white-space:pre-wrap;overflow-wrap:anywhere}tbody tr:nth-child(even){background:#fafbfd}td a{color:#2864dc;text-decoration:underline}.table-title{margin:0}.export-links a{color:#2864dc;margin-left:14px}@media(max-width:600px){.wrap{margin:18px auto}.card{padding:16px}h1{font-size:27px}}
 </style></head><body><main class="wrap"><div class="row"><div><div class="brand">SHARE CERTIFICATE OCR</div><h1>Upload and extract</h1><p>Upload certificate scans and review job progress and CSV results here.</p></div><button id="logout" type="button">Sign out</button></div>
 <section class="card"><form id="form"><div class="drop" id="drop"><strong>Choose certificates</strong><p>PDF, PNG, JPG, TIFF, WEBP or BMP. You can select multiple files.</p><input id="files" name="files" type="file" accept=".pdf,.png,.jpg,.jpeg,.tif,.tiff,.webp,.bmp" multiple required></div>
 <div class="controls"><label>OCR engine<select name="engine"><option value="openai">OpenAI vision</option><option value="tesseract">Offline Tesseract</option></select></label><label>Workers<input name="workers" type="number" min="1" max="16" value="8"></label><button id="submit">Upload and start OCR</button><span class="muted" id="chosen">No files selected</span></div></form><p class="muted">OpenAI mode needs the server API key configured. Scans stay on this EC2 server.</p><div id="message"></div></section>
-<section class="card"><div class="row"><h2>Job status</h2><span class="pill" id="state">Ready</span></div><div class="bar"><div class="fill" id="fill"></div></div><p id="counts">No job started yet.</p><div class="files" id="results"></div></section>
+<section class="card"><div class="row"><h2>Job status</h2><span class="pill" id="state">Ready</span></div><div class="bar"><div class="fill" id="fill"></div></div><p id="counts">No job started yet.</p><div class="files export-links" id="results"></div></section>
+<section class="card"><div class="row"><h2 class="table-title">Results <span class="pill" id="record-count">0 records</span></h2><span class="muted">Click a file name to open its uploaded scan.</span></div><div class="table-wrap"><table><thead><tr><th>#</th><th>File</th><th>Name of Share</th><th>Folio No</th><th>Registered Folio No</th><th>Certificate No</th><th>Name of Share Holder</th><th>No of Shares</th><th>Face Value / Share</th><th>Share Type</th><th>Distinctive No</th><th>Date of Issue</th><th>Latest Share Holder</th><th>Latest Folio No</th><th>Folio No History</th><th>Share Holder History</th><th>Remarks</th><th>Flags</th></tr></thead><tbody id="result-rows"></tbody></table></div></section>
 </main><script>
 document.querySelector('#logout').addEventListener('click',async()=>{await fetch('/api/auth/logout',{method:'POST',headers:{'X-CSRF-Token':document.querySelector('meta[name=csrf-token]').content}});location.reload()});
 const form=document.querySelector('#form'), files=document.querySelector('#files'), msg=document.querySelector('#message');
@@ -241,7 +310,8 @@ files.addEventListener('change',()=>document.querySelector('#chosen').textConten
 document.querySelector('#drop').addEventListener('dragover',e=>{e.preventDefault()});document.querySelector('#drop').addEventListener('drop',e=>{e.preventDefault();files.files=e.dataTransfer.files;files.dispatchEvent(new Event('change'))});
 form.addEventListener('submit',async e=>{e.preventDefault();if(!files.files.length)return;const b=document.querySelector('#submit');b.disabled=true;msg.textContent='Uploading files…';msg.className='muted';try{const r=await fetch('/api/run',{method:'POST',headers:{'X-CSRF-Token':document.querySelector('meta[name=csrf-token]').content},body:new FormData(form)});const d=await r.json();if(!r.ok)throw new Error(d.error||'Upload failed');msg.textContent=`${d.queued} document(s) queued.`;msg.className='ok';refresh()}catch(err){msg.textContent=err.message;msg.className='error'}finally{b.disabled=false}});
 async function refresh(){try{const r=await fetch('/api/status');if(!r.ok)return;const d=await r.json();document.querySelector('#state').textContent=d.state;document.querySelector('#fill').style.width=d.progress+'%';const c=d.counts;document.querySelector('#counts').textContent=`${c.done||0} done · ${c.pending||0} waiting · ${c.dead||0} failed · ${d.rate||0} files/sec`;document.querySelector('#results').innerHTML=d.files.map(f=>`<a href="/api/results/${encodeURIComponent(f)}">Download ${f}</a>`).join('');if(d.error){msg.textContent=d.error;msg.className='error'}}catch(_){}}setInterval(refresh,2500);refresh();
-</script></body></html>'''
+async function refreshRows(){try{const r=await fetch('/api/rows');if(!r.ok)return;const d=await r.json(),body=document.querySelector('#result-rows');body.replaceChildren();document.querySelector('#record-count').textContent=d.total+' records';for(const x of d.rows){const tr=document.createElement('tr');for(const key of ['idx','file','company','folio','regfolio','cert','holder','shares','facevalue','sharetype','distinctive','date','latest','latestfolio','foliohistory','holderhistory','remarks','flags']){const td=document.createElement('td');if(key==='file'){const a=document.createElement('a');a.href=x.file_url;a.target='_blank';a.rel='noopener';a.textContent=x.file||'';td.append(a)}else td.textContent=x[key]??'';tr.append(td)}body.append(tr)}}catch(_){}}
+setInterval(refreshRows,2500);refreshRows();</script></body></html>'''
 
 
 def main() -> None:
