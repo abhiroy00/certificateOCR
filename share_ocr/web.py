@@ -10,7 +10,7 @@ import uuid
 from pathlib import Path
 from datetime import timedelta
 
-from flask import (Flask, abort, jsonify, make_response, request, send_file,
+from flask import (Flask, abort, jsonify, request, send_file,
                    session)
 from waitress import serve
 from werkzeug.utils import secure_filename
@@ -245,7 +245,6 @@ async function refresh(){try{const r=await fetch('/api/status');if(!r.ok)return;
 
 
 def main() -> None:
-    _password()  # fail fast with a clear setup message
     host = os.environ.get("SHARE_OCR_WEB_HOST", "0.0.0.0")
     port = int(os.environ.get("SHARE_OCR_WEB_PORT", "8000"))
     print(f"Share OCR browser UI listening on http://{host}:{port}")
