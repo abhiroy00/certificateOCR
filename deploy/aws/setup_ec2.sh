@@ -35,10 +35,11 @@ mkdir -p "${SHARE_OCR_HOME:-$HOME/.share_ocr}"
 
 echo "== systemd unit =="
 sudo install -m 0644 deploy/aws/share-ocr.service /etc/systemd/system/share-ocr.service
-if [ ! -f "$HOME/.share_ocr_web.env" ]; then
-    printf 'SHARE_OCR_WEB_PASSWORD=%s\n' "$(openssl rand -hex 24)" > "$HOME/.share_ocr_web.env"
-    chmod 600 "$HOME/.share_ocr_web.env"
+touch "$HOME/.share_ocr_web.env"
+if ! grep -q '^SHARE_OCR_WEB_SECRET=' "$HOME/.share_ocr_web.env"; then
+    printf 'SHARE_OCR_WEB_SECRET=%s\n' "$(openssl rand -hex 32)" >> "$HOME/.share_ocr_web.env"
 fi
+chmod 600 "$HOME/.share_ocr_web.env"
 sudo systemctl daemon-reload
 
 cat <<'EOF'
@@ -71,11 +72,8 @@ Setup done. Next:
      aws s3 sync ~/.share_ocr/csv s3://your-bucket/results
      # or scp -r ubuntu@<ec2-ip>:~/.share_ocr/csv ./results
 
-Browser UI is also installed. Set an EC2 security-group inbound rule for
-TCP 8000 from your own public IP only, then start it with:
-     sudo systemctl enable --now share-ocr
-     sudo cat ~/.share_ocr_web.env   # browser login password; keep it private
-Open http://<ec2-public-ip>:8000 in your browser. SSM keys and the instance
-role are required by the service (see deploy/aws/README.md).
+Browser UI is installed. It uses the same email + admin-relayed OTP login as
+the desktop app. Configure the SMTP sender parameters and EC2 role in SSM,
+then start it with `sudo systemctl enable --now share-ocr` (see README).
 
 EOF

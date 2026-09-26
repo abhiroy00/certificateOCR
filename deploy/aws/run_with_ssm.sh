@@ -20,6 +20,10 @@ export OPENAI_API_KEYS="$(aws ssm get-parameter --name /share-ocr/openai-keys \
     --with-decryption --query Parameter.Value --output text 2>/dev/null || true)"
 export NVIDIA_API_KEYS="$(aws ssm get-parameter --name /share-ocr/nvidia-keys \
     --with-decryption --query Parameter.Value --output text 2>/dev/null || true)"
+export SHARE_OCR_SMTP_USER="$(aws ssm get-parameter --name /share-ocr/smtp-user \
+    --with-decryption --query Parameter.Value --output text 2>/dev/null || true)"
+export SHARE_OCR_SMTP_PASSWORD="$(aws ssm get-parameter --name /share-ocr/smtp-password \
+    --with-decryption --query Parameter.Value --output text 2>/dev/null || true)"
 
 if [ -z "$OPENAI_API_KEYS" ] && [ -z "$NVIDIA_API_KEYS" ]; then
     echo "No keys found in SSM (/share-ocr/openai-keys, /share-ocr/nvidia-keys)." >&2

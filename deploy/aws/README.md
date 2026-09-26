@@ -1,26 +1,28 @@
 # Running this project on AWS EC2
 
-## Browser upload screen
+## Browser screen and OTP login
 
-The web UI lets you upload PDFs or images, start OCR, watch queue progress,
-and download the CSV. It serves on TCP port `8000`; it does not expose the
-desktop Tkinter window. The instance role must be able to read the SSM API-key
-parameters documented below. `setup_ec2.sh` installs the UI and creates a
-random login password in `/home/ubuntu/.share_ocr_web.env` (mode 0600).
+The browser UI now follows the desktop access flow: a user enters an email,
+the OTP goes to the configured administrator inbox, and the administrator
+relays the code. After verification, users can upload scans, run OCR, watch
+progress, and download CSV output. The server needs the SMTP sender account
+used by the desktop app. Keep its Gmail App Password in SSM, never GitHub.
+`setup_ec2.sh` creates a random session secret in
+`/home/ubuntu/.share_ocr_web.env` (mode 0600).
 
-After setup, add an EC2 security-group inbound rule **Custom TCP / 8000 / My
-IP**. Do not use `0.0.0.0/0`. Then open the generated password and start the
-web service:
+For public access, add **Custom TCP / 8000 / Anywhere-IPv4**. For real
+certificate documents, put the site behind HTTPS before sharing widely.
+The EC2 instance role must be able to read the API and SMTP parameters.
+Start the service:
 
 ```bash
-sudo cat /home/ubuntu/.share_ocr_web.env
 sudo systemctl enable --now share-ocr
 sudo systemctl status share-ocr
 ```
 
-Visit `http://13.235.100.134:8000` and sign in as `admin` with that password.
-Keep port 8000 limited to your own public IP. The simple instance URL uses
-HTTP; for use beyond a private, IP-restricted test, put the UI behind HTTPS.
+Visit `http://<elastic-ip>:8000`. Enter an email and use the code relayed by
+the administrator at `ADMIN_EMAIL`. The direct instance URL uses HTTP; for
+certificate documents or broad sharing, put the UI behind HTTPS.
 After changing web code or requirements, pull the update and rerun
 `bash deploy/aws/setup_ec2.sh`, then restart the service.
 
@@ -59,6 +61,10 @@ aws ssm put-parameter --region ap-south-1 --name /share-ocr/openai-keys `
   --type SecureString --overwrite --value "YOUR_OPENAI_KEY"
 aws ssm put-parameter --region ap-south-1 --name /share-ocr/nvidia-keys `
   --type SecureString --overwrite --value "YOUR_NVIDIA_KEY"
+aws ssm put-parameter --region ap-south-1 --name /share-ocr/smtp-user `
+  --type SecureString --overwrite --value "YOUR_SENDER_GMAIL"
+aws ssm put-parameter --region ap-south-1 --name /share-ocr/smtp-password `
+  --type SecureString --overwrite --value "YOUR_GMAIL_APP_PASSWORD"
 ```
 
 Only create a parameter for an engine you actually use. After uploading scans
@@ -237,7 +243,7 @@ the same failed-files sheet, `Review` is the same mostly-"No" column.
 
 ## 7. Persistent browser service (survives reboots)
 
-`setup_ec2.sh` installs the unit file and creates the browser login password.
+`setup_ec2.sh` installs the unit file and creates the Flask session secret.
 Configure the security-group rule and SSM instance role/parameters first,
 then follow the browser UI instructions at the top of this guide. Uploaded
 files can be submitted from the browser without manually copying them into

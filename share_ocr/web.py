@@ -8,6 +8,7 @@ import threading
 import time
 import uuid
 from pathlib import Path
+from datetime import timedelta
 
 from flask import (Flask, abort, jsonify, make_response, request, send_file,
                    session)
@@ -15,31 +16,31 @@ from waitress import serve
 from werkzeug.utils import secure_filename
 
 from .config import SUPPORTED_EXT, Settings
+from .otp_auth import (MAX_ATTEMPTS, OTP_TTL_SECONDS,
+                       RESEND_COOLDOWN_SECONDS, OtpChallenge, OtpMailError,
+                       generate_otp, is_valid_email, send_otp_email)
+from .smtp_config import ADMIN_EMAIL
 from .pipeline import Pipeline
 
 app = Flask(__name__)
 app.secret_key = os.environ.get("SHARE_OCR_WEB_SECRET") or secrets.token_bytes(32)
 app.config["MAX_CONTENT_LENGTH"] = 500 * 1024 * 1024
+app.config["PERMANENT_SESSION_LIFETIME"] = timedelta(hours=12)
 
 _job_lock = threading.Lock()
 _job: dict = {"state": "idle", "pipeline": None, "error": ""}
-
-
-def _password() -> str:
-    value = os.environ.get("SHARE_OCR_WEB_PASSWORD", "")
-    if len(value) < 12:
-        raise RuntimeError("Set SHARE_OCR_WEB_PASSWORD to a password of at least 12 characters.")
-    return value
+_otp_lock = threading.Lock()
+_challenges: dict[str, OtpChallenge] = {}
+_last_request: dict[str, float] = {}
+_ip_requests: dict[str, list[float]] = {}
 
 
 @app.before_request
 def _protect():
-    user = os.environ.get("SHARE_OCR_WEB_USER", "admin")
-    auth = request.authorization
-    if not auth or auth.username != user or not hmac.compare_digest(
-            auth.password or "", _password()):
-        return make_response("Login required", 401,
-                             {"WWW-Authenticate": 'Basic realm="Share OCR"'})
+    if request.endpoint in {"index", "request_otp", "verify_otp", "logout"}:
+        return None
+    if not session.get("authenticated"):
+        return jsonify({"error": "Please sign in with your email OTP."}), 401
 
 
 def _csrf_ok() -> bool:
@@ -51,7 +52,71 @@ def _csrf_ok() -> bool:
 def index():
     token = secrets.token_urlsafe(24)
     session["csrf"] = token
-    return PAGE.replace("__CSRF__", token)
+    page = PAGE if session.get("authenticated") else LOGIN_PAGE
+    return page.replace("__CSRF__", token)
+
+
+@app.post("/api/auth/request-otp")
+def request_otp():
+    if not _csrf_ok():
+        abort(403)
+    email = (request.json or {}).get("email", "").strip()
+    if not is_valid_email(email):
+        return jsonify({"error": "Enter a valid email address."}), 400
+
+    now = time.time()
+    sid = session.setdefault("otp_sid", secrets.token_urlsafe(24))
+    client_ip = request.remote_addr or "unknown"
+    with _otp_lock:
+        last = _last_request.get(sid, 0)
+        if now - last < RESEND_COOLDOWN_SECONDS:
+            return jsonify({"error": f"Wait {int(RESEND_COOLDOWN_SECONDS - (now-last))} seconds before requesting another code."}), 429
+        recent = [t for t in _ip_requests.get(client_ip, []) if now - t < 3600]
+        if len(recent) >= 20:
+            return jsonify({"error": "Too many access requests from this network. Try again later."}), 429
+        recent.append(now)
+        _ip_requests[client_ip] = recent
+
+    code = generate_otp()
+    challenge = OtpChallenge(email=email, code=code)
+    try:
+        send_otp_email(email, code)
+    except OtpMailError as exc:
+        return jsonify({"error": str(exc)}), 503
+    with _otp_lock:
+        _challenges[sid] = challenge
+        _last_request[sid] = now
+    return jsonify({"message": f"Access code sent to the administrator ({ADMIN_EMAIL}). Ask them for it. It expires in {OTP_TTL_SECONDS // 60} minutes."})
+
+
+@app.post("/api/auth/verify-otp")
+def verify_otp():
+    if not _csrf_ok():
+        abort(403)
+    sid = session.get("otp_sid", "")
+    with _otp_lock:
+        challenge = _challenges.get(sid)
+        if not challenge:
+            return jsonify({"error": "Request an access code first."}), 400
+        ok, message = challenge.check((request.json or {}).get("code", ""))
+        if ok:
+            _challenges.pop(sid, None)
+            _last_request.pop(sid, None)
+    if not ok:
+        return jsonify({"error": message}), 400
+    session.clear()
+    session["authenticated"] = True
+    session["permanent"] = True
+    session["csrf"] = secrets.token_urlsafe(24)
+    return jsonify({"ok": True})
+
+
+@app.post("/api/auth/logout")
+def logout():
+    if not _csrf_ok():
+        abort(403)
+    session.clear()
+    return jsonify({"ok": True})
 
 
 @app.get("/api/status")
@@ -145,16 +210,32 @@ def result_file(name: str):
     return send_file(path, as_attachment=True, download_name=name)
 
 
+LOGIN_PAGE = r'''<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="csrf-token" content="__CSRF__"><title>Share Certificate OCR - Sign in</title>
+<style>
+*{box-sizing:border-box}body{margin:0;background:#f3f6fb;color:#152238;font:16px system-ui,Segoe UI,sans-serif}.wrap{max-width:520px;margin:9vh auto;padding:0 20px}.card{background:#fff;border:1px solid #e3e9f2;border-radius:14px;padding:34px;box-shadow:0 8px 30px #182a4710}h1{font-size:25px;margin:0 0 8px}p{color:#63718a;line-height:1.5}label{display:block;font-weight:600;margin:20px 0 7px}input{width:100%;padding:12px;border:1px solid #ccd6e4;border-radius:8px;font:inherit}button{margin-top:16px;border:0;border-radius:8px;background:#2864dc;color:white;font-weight:650;padding:12px 18px;cursor:pointer}button:disabled{opacity:.55}.muted{font-size:14px;color:#63718a}.error{color:#b42318}.ok{color:#147d50}#verify{display:none;border-top:1px solid #dce4ef;margin-top:24px;padding-top:8px}
+</style></head><body><main class="wrap"><section class="card"><h1>Share Certificate OCR</h1><p>Enter your email to request access.</p>
+<form id="request"><label for="email">Email</label><input id="email" type="email" autocomplete="email" required><button id="send">Send access code</button></form>
+<div id="verify"><p>Code sent to the administrator. Ask them for it.</p><label for="code">Access code</label><input id="code" inputmode="numeric" maxlength="6" autocomplete="one-time-code"><button id="check">Verify and open OCR</button></div><p id="message" class="muted"></p>
+</section></main><script>
+const csrf=document.querySelector('meta[name=csrf-token]').content,msg=document.querySelector('#message');
+document.querySelector('#request').addEventListener('submit',async e=>{e.preventDefault();const b=document.querySelector('#send');b.disabled=true;msg.textContent='Sending request…';try{const r=await fetch('/api/auth/request-otp',{method:'POST',headers:{'Content-Type':'application/json','X-CSRF-Token':csrf},body:JSON.stringify({email:document.querySelector('#email').value})});const d=await r.json();if(!r.ok)throw Error(d.error);document.querySelector('#verify').style.display='block';msg.textContent=d.message;msg.className='ok'}catch(err){msg.textContent=err.message;msg.className='error'}finally{b.disabled=false}});
+document.querySelector('#check').addEventListener('click',async()=>{const b=document.querySelector('#check');b.disabled=true;try{const r=await fetch('/api/auth/verify-otp',{method:'POST',headers:{'Content-Type':'application/json','X-CSRF-Token':csrf},body:JSON.stringify({code:document.querySelector('#code').value})});const d=await r.json();if(!r.ok)throw Error(d.error);location.reload()}catch(err){msg.textContent=err.message;msg.className='error'}finally{b.disabled=false}});
+</script></body></html>'''
+
+
 PAGE = r'''<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="csrf-token" content="__CSRF__"><title>Share Certificate OCR</title>
 <style>
 *{box-sizing:border-box}body{margin:0;background:#f3f6fb;color:#152238;font:16px system-ui,Segoe UI,sans-serif}.wrap{max-width:900px;margin:48px auto;padding:0 20px}.brand{color:#2864dc;font-weight:700;letter-spacing:.08em;font-size:13px}.card{background:#fff;border:1px solid #e3e9f2;border-radius:18px;padding:26px;margin-top:20px;box-shadow:0 8px 30px #182a4710}h1{font-size:32px;margin:8px 0}p{color:#63718a}.drop{border:2px dashed #b8c7dc;border-radius:14px;padding:36px 18px;text-align:center;background:#f9fbff;cursor:pointer}.drop:hover{border-color:#2864dc}.controls{display:flex;gap:16px;align-items:end;flex-wrap:wrap;margin-top:18px}label{display:grid;gap:7px;color:#52627b;font-size:14px}select,input[type=number]{padding:10px;border:1px solid #ccd6e4;border-radius:9px;background:white;color:#152238}button{border:0;border-radius:10px;background:#2864dc;color:white;font-weight:650;padding:12px 20px;cursor:pointer}button:disabled{opacity:.55;cursor:wait}.muted{color:#75839a;font-size:13px}.bar{height:10px;border-radius:9px;background:#e7edf6;overflow:hidden}.fill{height:100%;width:0;background:#2864dc;transition:width .3s}.row{display:flex;justify-content:space-between;gap:16px;align-items:center}.pill{border-radius:99px;padding:5px 11px;background:#edf2fa;font-size:13px;text-transform:capitalize}.files a{display:inline-block;margin:8px 10px 0 0;color:#2864dc}.error{color:#b42318}.ok{color:#147d50}@media(max-width:600px){.wrap{margin:20px auto}.card{padding:19px}h1{font-size:27px}}
-</style></head><body><main class="wrap"><div class="brand">SHARE CERTIFICATE OCR</div><h1>Upload and extract</h1><p>Upload certificate scans and review job progress and CSV results here.</p>
+</style></head><body><main class="wrap"><div class="row"><div><div class="brand">SHARE CERTIFICATE OCR</div><h1>Upload and extract</h1><p>Upload certificate scans and review job progress and CSV results here.</p></div><button id="logout" type="button">Sign out</button></div>
 <section class="card"><form id="form"><div class="drop" id="drop"><strong>Choose certificates</strong><p>PDF, PNG, JPG, TIFF, WEBP or BMP. You can select multiple files.</p><input id="files" name="files" type="file" accept=".pdf,.png,.jpg,.jpeg,.tif,.tiff,.webp,.bmp" multiple required></div>
 <div class="controls"><label>OCR engine<select name="engine"><option value="openai">OpenAI vision</option><option value="tesseract">Offline Tesseract</option></select></label><label>Workers<input name="workers" type="number" min="1" max="16" value="8"></label><button id="submit">Upload and start OCR</button><span class="muted" id="chosen">No files selected</span></div></form><p class="muted">OpenAI mode needs the server API key configured. Scans stay on this EC2 server.</p><div id="message"></div></section>
 <section class="card"><div class="row"><h2>Job status</h2><span class="pill" id="state">Ready</span></div><div class="bar"><div class="fill" id="fill"></div></div><p id="counts">No job started yet.</p><div class="files" id="results"></div></section>
 </main><script>
+document.querySelector('#logout').addEventListener('click',async()=>{await fetch('/api/auth/logout',{method:'POST',headers:{'X-CSRF-Token':document.querySelector('meta[name=csrf-token]').content}});location.reload()});
 const form=document.querySelector('#form'), files=document.querySelector('#files'), msg=document.querySelector('#message');
 files.addEventListener('change',()=>document.querySelector('#chosen').textContent=files.files.length?`${files.files.length} file(s) selected`:'No files selected');
 document.querySelector('#drop').addEventListener('dragover',e=>{e.preventDefault()});document.querySelector('#drop').addEventListener('drop',e=>{e.preventDefault();files.files=e.dataTransfer.files;files.dispatchEvent(new Event('change'))});
