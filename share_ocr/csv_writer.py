@@ -19,7 +19,7 @@ import re
 import threading
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Callable, Dict, List, Optional
 
 from .config import (CERT_NO_HEADER, CSV_COLUMNS, CSV_HEADER_ALIASES,
                      CSV_SPEC, EXTRACTED_AT_HEADER, FLAGS_HEADER,
@@ -42,10 +42,24 @@ _HYPERLINK_RE = re.compile(
     re.IGNORECASE | re.DOTALL)
 
 
+# Optional hook that turns a local scan path into the link target written to
+# the CSV. The desktop app leaves it unset (a local path opens fine); the
+# browser UI sets it so Excel on the user's own PC gets an http:// URL back
+# to the server instead of a server-side path it cannot open.
+_link_resolver: Optional[Callable[[str], Optional[str]]] = None
+
+
+def set_link_resolver(fn: Optional[Callable[[str], Optional[str]]]) -> None:
+    global _link_resolver
+    _link_resolver = fn
+
+
 def hyperlink_cell(path: Optional[str], display: str) -> str:
     """A Source File cell that opens `path` when clicked in Excel, showing
     `display` as the visible text. Falls back to plain `display` text when
     there is no path to link to (older shards never recorded one)."""
+    if path and _link_resolver:
+        path = _link_resolver(path) or path
     if not path:
         return display
     esc = lambda s: (s or "").replace('"', '""')           # noqa: E731

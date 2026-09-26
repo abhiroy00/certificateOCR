@@ -10,14 +10,15 @@ import time
 import uuid
 from pathlib import Path
 from datetime import timedelta
+from urllib.parse import quote
 
 from flask import (Flask, abort, jsonify, request, send_file, session,
                    url_for)
 from waitress import serve
-from werkzeug.utils import secure_filename
 
 from .config import SUPPORTED_EXT, Settings
 from . import db
+from .csv_writer import set_link_resolver
 from .otp_auth import (MAX_ATTEMPTS, OTP_TTL_SECONDS,
                        RESEND_COOLDOWN_SECONDS, OtpChallenge, OtpMailError,
                        generate_otp, is_valid_email, send_otp_email)
@@ -30,17 +31,57 @@ app.secret_key = os.environ.get("SHARE_OCR_WEB_SECRET") or secrets.token_bytes(3
 app.config["MAX_CONTENT_LENGTH"] = 500 * 1024 * 1024
 app.config["PERMANENT_SESSION_LIFETIME"] = timedelta(hours=12)
 
+UPLOADS_ROOT = Path.home() / "scans" / "uploads"
+
 _job_lock = threading.Lock()
 _job: dict = {"state": "idle", "pipeline": None, "error": ""}
 _otp_lock = threading.Lock()
 _challenges: dict[str, OtpChallenge] = {}
 _last_request: dict[str, float] = {}
 _ip_requests: dict[str, list[float]] = {}
+# Base URL (e.g. http://13.235.223.180:8000) written into the CSV links.
+_public_base = os.environ.get("SHARE_OCR_PUBLIC_URL", "").rstrip("/")
+
+
+def _clean_name(filename: str) -> str:
+    """The uploaded file's own name, unchanged except for anything that
+    could escape the upload folder (path parts, control characters)."""
+    name = filename.replace("\\", "/").rsplit("/", 1)[-1]
+    name = "".join(ch for ch in name if ch.isprintable()).strip()
+    if name in {"", ".", ".."}:
+        return ""
+    return name[:200]
+
+
+def _sign(rel: str) -> str:
+    key = app.secret_key if isinstance(app.secret_key, bytes) else app.secret_key.encode()
+    return hmac.new(key, rel.encode("utf-8"), "sha256").hexdigest()[:32]
+
+
+def _scan_link(path: str) -> str | None:
+    """Signed http:// link to an uploaded scan, so the file name in the
+    downloaded CSV opens from Excel on the user's PC (a server path cannot)."""
+    if not _public_base:
+        return None
+    try:
+        rel = Path(path).resolve().relative_to(UPLOADS_ROOT.resolve()).as_posix()
+    except ValueError:
+        return None
+    return f"{_public_base}/scan/{quote(rel)}?k={_sign(rel)}"
+
+
+set_link_resolver(_scan_link)
+
+
+def _remember_base_url() -> None:
+    global _public_base
+    if not os.environ.get("SHARE_OCR_PUBLIC_URL"):
+        _public_base = request.host_url.rstrip("/")
 
 
 @app.before_request
 def _protect():
-    if request.endpoint in {"index", "request_otp", "verify_otp", "logout"}:
+    if request.endpoint in {"index", "request_otp", "verify_otp", "logout", "signed_scan"}:
         return None
     if not session.get("authenticated"):
         return jsonify({"error": "Please sign in with your email OTP."}), 401
@@ -55,6 +96,7 @@ def _csrf_ok() -> bool:
 def index():
     token = secrets.token_urlsafe(24)
     session["csrf"] = token
+    _remember_base_url()
     page = PAGE if session.get("authenticated") else LOGIN_PAGE
     return page.replace("__CSRF__", token)
 
@@ -215,9 +257,8 @@ def source_file(row_id: int):
     if not row:
         abort(404)
     path = Path(row[0]).resolve()
-    uploads_root = (Path.home() / "scans" / "uploads").resolve()
     try:
-        path.relative_to(uploads_root)
+        path.relative_to(UPLOADS_ROOT.resolve())
     except ValueError:
         abort(404)
     if not path.is_file():
@@ -237,12 +278,28 @@ def failure_source(file_id: int):
         abort(404)
     path = Path(row[0]).resolve()
     try:
-        path.relative_to((Path.home() / "scans" / "uploads").resolve())
+        path.relative_to(UPLOADS_ROOT.resolve())
     except ValueError:
         abort(404)
     if not path.is_file():
         abort(404)
     return send_file(path, as_attachment=False, download_name=row[1])
+
+
+@app.get("/scan/<path:rel>")
+def signed_scan(rel: str):
+    """Open an uploaded scan from a CSV/Excel link. No login needed: the
+    link carries an HMAC signature, so only links this server wrote work."""
+    if not hmac.compare_digest(request.args.get("k", ""), _sign(rel)):
+        abort(404)
+    path = (UPLOADS_ROOT / rel).resolve()
+    try:
+        path.relative_to(UPLOADS_ROOT.resolve())
+    except ValueError:
+        abort(404)
+    if not path.is_file():
+        abort(404)
+    return send_file(path, as_attachment=False, download_name=path.name)
 
 
 @app.get("/api/settings")
@@ -322,15 +379,22 @@ def run_job():
         if not uploads:
             return jsonify({"error": "Choose one or more PDF or image files."}), 400
 
+        _remember_base_url()
         job_id = uuid.uuid4().hex
-        folder = Path.home() / "scans" / "uploads" / job_id
+        folder = UPLOADS_ROOT / job_id
         folder.mkdir(parents=True, exist_ok=True)
         saved_paths = []
         for item in uploads:
-            safe = secure_filename(Path(item.filename).name)
-            if not safe:
+            name = _clean_name(item.filename)
+            if not name:
                 continue
-            target = folder / f"{uuid.uuid4().hex[:8]}_{safe}"
+            # Keep the exact original name; a second file with the same name
+            # in one upload goes into its own numbered sub-folder instead.
+            target, n = folder / name, 1
+            while target.exists():
+                n += 1
+                target = folder / str(n) / name
+            target.parent.mkdir(parents=True, exist_ok=True)
             item.save(target)
             saved_paths.append(str(target))
         if not saved_paths:

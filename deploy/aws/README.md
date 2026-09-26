@@ -23,6 +23,11 @@ sudo systemctl status share-ocr
 Visit `http://<elastic-ip>:8000`. Enter an email and use the code relayed by
 the administrator at `ADMIN_EMAIL`. The direct instance URL uses HTTP; for
 certificate documents or broad sharing, put the UI behind HTTPS.
+Uploaded scans keep their original file names. In the downloaded CSV, the
+file name links to `http://<server>:8000/scan/...` with a signature, so
+clicking it in Excel on your PC opens the scan. The link uses the address you
+browsed to; to force a different one (e.g. an HTTPS domain), add
+`SHARE_OCR_PUBLIC_URL=https://your-domain` to `~/.share_ocr_web.env`.
 After changing web code or requirements, pull the update and rerun
 `bash deploy/aws/setup_ec2.sh`, then restart the service.
 
