@@ -10,8 +10,9 @@ import tempfile
 import threading
 import time
 import uuid
+import zipfile
 from pathlib import Path
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 from urllib.parse import quote
 
 from flask import (Flask, abort, jsonify, request, send_file, session,
@@ -20,7 +21,9 @@ from waitress import serve
 
 from .config import SUPPORTED_EXT, Settings
 from . import db
-from .csv_writer import ShardedCsvWriter, set_link_resolver
+from .config import CSV_COLUMNS, EXTRACTED_AT_HEADER, SOURCE_FILE_HEADER
+from .csv_writer import (ShardedCsvWriter, failed_file_row, plain_value,
+                         record_to_row, set_link_resolver)
 from .otp_auth import (MAX_ATTEMPTS, OTP_TTL_SECONDS,
                        RESEND_COOLDOWN_SECONDS, OtpChallenge, OtpMailError,
                        generate_otp, is_valid_email, send_otp_email)
@@ -518,6 +521,105 @@ def result_xlsx():
                      mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
 
+ZIP_README = """Share Certificate OCR - results with scans
+
+1. Extract this ZIP first (right-click > Extract All). Opening the Excel
+   file straight from inside the ZIP will not open the scans.
+2. Open certificates.xlsx from the extracted folder.
+3. Click a file name to open that scan from the "scans" folder next to it.
+
+Keep certificates.xlsx and the scans folder together if you move them.
+"""
+
+
+@app.get("/api/results-zip")
+def results_zip():
+    """certificates.xlsx plus every scan it lists, in one ZIP. The file-name
+    links are relative (scans/1884.pdf), so after extracting, a click opens
+    the copy on the user's own PC - no server URL anywhere."""
+    try:
+        from openpyxl import Workbook
+        from openpyxl.styles import Font
+    except ImportError:
+        return jsonify({"error": "Excel export needs openpyxl on the server: pip install openpyxl"}), 500
+    s = Settings.load()
+    q = db.Queue(s.db_path)
+    try:
+        results = q.conn.execute(
+            "SELECT r.payload, r.created_at, f.name, f.path FROM results r"
+            " JOIN files f ON f.id = r.file_id ORDER BY r.row_id").fetchall()
+        dead = q.conn.execute(
+            "SELECT name, path, error FROM files WHERE status='dead' ORDER BY updated_at").fetchall()
+    finally:
+        q.close()
+    if not results and not dead:
+        abort(404)
+
+    in_zip: dict[str, str] = {}      # server path -> path inside the ZIP
+    used: set[str] = set()
+
+    def zip_name(path: str, name: str) -> str | None:
+        if not path or not Path(path).is_file():
+            return None
+        if path not in in_zip:
+            rel, n = f"scans/{name}", 1
+            while rel.lower() in used:
+                n += 1
+                rel = f"scans/{n}/{name}"
+            used.add(rel.lower())
+            in_zip[path] = rel
+        return in_zip[path]
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "certificates"
+    ws.append(CSV_COLUMNS)
+    for cell in ws[1]:
+        cell.font = Font(bold=True)
+    link_col = CSV_COLUMNS.index(SOURCE_FILE_HEADER) + 1
+
+    def add(row: dict, path: str, name: str) -> None:
+        row[SOURCE_FILE_HEADER] = name
+        ws.append([plain_value(row.get(h, "")) for h in CSV_COLUMNS])
+        rel = zip_name(path, name)
+        if rel:
+            cell = ws.cell(row=ws.max_row, column=link_col)
+            cell.hyperlink = rel
+            cell.style = "Hyperlink"
+
+    for payload, created_at, name, path in results:
+        try:
+            rec = json.loads(payload)
+        except (TypeError, ValueError):
+            rec = {}
+        row = record_to_row(rec, name=name)
+        if created_at:
+            row[EXTRACTED_AT_HEADER] = datetime.fromtimestamp(
+                created_at, timezone.utc).isoformat(timespec="seconds")
+        add(row, path, name)
+    for name, path, error in dead:
+        add(failed_file_row(name, None, error or ""), path, name)
+
+    fd, tmp = tempfile.mkstemp(suffix=".zip")
+    os.close(fd)
+    try:
+        with zipfile.ZipFile(tmp, "w", zipfile.ZIP_DEFLATED) as zf:
+            buf = io.BytesIO()
+            wb.save(buf)
+            zf.writestr("certificates.xlsx", buf.getvalue())
+            zf.writestr("README.txt", ZIP_README)
+            for path, rel in in_zip.items():
+                # scans are already compressed; storing them is much faster
+                zf.write(path, rel, compress_type=zipfile.ZIP_STORED)
+    except Exception:
+        os.unlink(tmp)
+        raise
+    response = send_file(tmp, as_attachment=True, download_name="certificates-with-scans.zip",
+                         mimetype="application/zip")
+    response.call_on_close(lambda: os.path.exists(tmp) and os.unlink(tmp))
+    return response
+
+
 LOGIN_PAGE = r'''<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="csrf-token" content="__CSRF__"><title>Share Certificate OCR - Sign in</title>
@@ -555,7 +657,7 @@ document.querySelector('#modal-close').addEventListener('click',()=>document.que
 document.querySelector('#modal').addEventListener('click',e=>{if(e.target.id==='modal')e.currentTarget.hidden=true});
 document.querySelector('#logout').addEventListener('click',async()=>{await post('/api/auth/logout');location.reload()});
 document.querySelector('#api-keys').addEventListener('click',async()=>{showModal('API keys');const box=document.querySelector('#modal-content');box.textContent='Loading key status…';try{const r=await fetch('/api/settings'),d=await r.json();box.replaceChildren();const grid=document.createElement('div');grid.className='key-counts';for(const p of Object.values(d.keys)){const card=document.createElement('div');card.className='key-count';const b=document.createElement('strong');b.textContent=p.label;const line=document.createElement('p');line.textContent=`${p.count} key(s) configured · ${p.source}`;card.append(b,line);grid.append(card)}const note=document.createElement('p');note.textContent='Multiple keys are supported. For safety, enter or change API keys on the EC2 server over SSH (or AWS Systems Manager), not in this HTTP browser page. Put keys in OPENAI_API_KEYS separated by commas; NVIDIA_API_KEYS is also supported. No code edit is needed.';box.append(grid,note)}catch(_){box.textContent='Could not read API key status.'}});
-document.querySelector('#output-folder').addEventListener('click',async()=>{showModal('Output folder');const box=document.querySelector('#modal-content');box.textContent='Loading output files…';try{const r=await fetch('/api/output'),d=await r.json();box.replaceChildren();if(!d.files.length){const empty=document.createElement('p');empty.textContent='No output files yet.';box.append(empty)}for(const f of d.files){const a=document.createElement('a');a.href='/api/results/'+encodeURIComponent(f);a.textContent='Download '+f;a.style.display='block';a.style.margin='10px 0';box.append(a)}if(d.files.some(f=>f.startsWith('certificates-part-'))){const x=xlsxLink();x.style.display='block';x.style.margin='10px 0';box.append(x)}}catch(_){box.textContent='Could not list output files.'}});
+document.querySelector('#output-folder').addEventListener('click',async()=>{showModal('Output folder');const box=document.querySelector('#modal-content');box.textContent='Loading output files…';try{const r=await fetch('/api/output'),d=await r.json();box.replaceChildren();if(!d.files.length){const empty=document.createElement('p');empty.textContent='No output files yet.';box.append(empty)}for(const f of d.files){const a=document.createElement('a');a.href='/api/results/'+encodeURIComponent(f);a.textContent='Download '+f;a.style.display='block';a.style.margin='10px 0';box.append(a)}if(d.files.some(f=>f.startsWith('certificates-part-'))){for(const x of [xlsxLink(),zipLink()]){x.style.display='block';x.style.margin='10px 0';box.append(x)}}}catch(_){box.textContent='Could not list output files.'}});
 function updateChosen(){const n=files.files.length+folderFiles.files.length;document.querySelector('#chosen').textContent=n?`${n} file(s) selected`:'Nothing selected';renderPreviews()}
 const PDFJS='https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/';let pdfjsReady=null,previewUrls=[],previewToken=0;
 function loadPdfJs(){if(!pdfjsReady)pdfjsReady=new Promise((res,rej)=>{const sc=document.createElement('script');sc.src=PDFJS+'pdf.min.js';sc.onload=()=>{pdfjsLib.GlobalWorkerOptions.workerSrc=PDFJS+'pdf.worker.min.js';res(pdfjsLib)};sc.onerror=()=>{pdfjsReady=null;rej(Error('pdf.js'))};document.head.append(sc)});return pdfjsReady}
@@ -570,6 +672,7 @@ const localFolder=document.querySelector('#local-folder');try{localFolder.value=
 localFolder.addEventListener('change',()=>{try{localStorage.setItem('localFolder',localFolder.value.trim())}catch(_){}});
 function relPaths(){return[...[...files.files].map(f=>f.name),...[...folderFiles.files].map(f=>(f.webkitRelativePath||'').split('/').slice(1).join('/')||f.name)]}
 function xlsxLink(){const a=document.createElement('a');a.href='/api/results-xlsx';a.textContent='Download Excel (.xlsx)';return a}
+function zipLink(){const a=document.createElement('a');a.href='/api/results-zip';a.textContent='Download Excel + scans (.zip) - opens scans from your PC';a.title='Extract the ZIP, then open certificates.xlsx. Clicking a file name opens the scan from the extracted folder.';return a}
 form.addEventListener('submit',async e=>{e.preventDefault();if(!files.files.length&&!folderFiles.files.length){msg.textContent='Select files or a folder first.';msg.className='error';return}const b=document.querySelector('#submit');b.disabled=true;msg.textContent='Uploading files…';msg.className='muted';try{const r=await fetch('/api/run',{method:'POST',headers:{'X-CSRF-Token':csrf},body:(()=>{const fd=new FormData(form);fd.append('rel_paths',JSON.stringify(relPaths()));return fd})()}),d=await r.json();if(!r.ok)throw Error(d.error||'Upload failed');msg.textContent=`${d.queued} document(s) queued.`;msg.className='ok';document.querySelector('#pause').disabled=false;document.querySelector('#stop').disabled=false;refresh()}catch(err){msg.textContent=err.message;msg.className='error'}finally{b.disabled=false}});
 async function control(action){try{const r=await post('/api/actions/'+action),d=await r.json();if(!r.ok)throw Error(d.error);refresh()}catch(err){msg.textContent=err.message;msg.className='error'}}
 document.querySelector('#pause').addEventListener('click',()=>control(document.querySelector('#pause').textContent==='Pause'?'pause':'resume'));
@@ -580,7 +683,7 @@ function updateSelected(){const n=selectedIds.size;document.querySelector('#sele
 document.querySelector('#result-rows').addEventListener('click',e=>{if(e.target.closest('a'))return;const tr=e.target.closest('tr');if(!tr)return;const id=tr.dataset.id;if(selectedIds.has(id)){selectedIds.delete(id);tr.classList.remove('selected-row')}else{selectedIds.add(id);tr.classList.add('selected-row')}updateSelected()});
 document.querySelector('#delete-selected').addEventListener('click',async()=>{if(currentView==='failed'){msg.textContent='Failed files have no extracted rows to delete. They will be listed in the failed CSV.';msg.className='error';return}const ids=[...selectedIds];if(!ids.length){msg.textContent='Select one or more rows first.';msg.className='error';return}if(!confirm(`Delete ${ids.length} selected row(s)? The source files remain on the server and the rows will be removed from the results and CSV.`))return;try{const r=await post('/api/actions/delete',{row_ids:ids}),d=await r.json();if(!r.ok)throw Error(d.error);msg.textContent=`Deleted ${d.deleted} row(s).`;msg.className='ok';selectedIds.clear();rowsRevision=null;refreshRows(true);refresh()}catch(err){msg.textContent=err.message;msg.className='error'}});
 document.querySelector('#clear-all').addEventListener('click',async()=>{if(!confirm('Clear the queue, all extracted rows and CSV outputs? Uploaded original scans will remain on the server.'))return;try{const r=await post('/api/actions/clear'),d=await r.json();if(!r.ok)throw Error(d.error);selectedIds.clear();rowsRevision=null;msg.textContent='Cleared.';msg.className='ok';refreshRows(true);refresh()}catch(err){msg.textContent=err.message;msg.className='error'}});
-async function refresh(){try{const r=await fetch('/api/status');if(!r.ok)return;const d=await r.json();document.querySelector('#state').textContent=d.state;document.querySelector('#fill').style.width=d.progress+'%';const c=d.counts;document.querySelector('#counts').textContent=`${c.done||0} done · ${c.pending||0} waiting · ${c.dead||0} failed · ${d.rate||0} files/sec`;const links=document.querySelector('#results');links.replaceChildren();for(const f of d.files){const a=document.createElement('a');a.href='/api/results/'+encodeURIComponent(f);a.textContent='Download '+f;links.append(a)}if(d.files.some(f=>f.startsWith('certificates-part-')))links.append(xlsxLink());const active=['running','paused','stopping'].includes(d.state);document.querySelector('#pause').disabled=!['running','paused'].includes(d.state);document.querySelector('#pause').textContent=d.state==='paused'?'Resume':'Pause';document.querySelector('#stop').disabled=!['running','paused'].includes(d.state);if(d.error){msg.textContent=d.error;msg.className='error'}}catch(_){}}
+async function refresh(){try{const r=await fetch('/api/status');if(!r.ok)return;const d=await r.json();document.querySelector('#state').textContent=d.state;document.querySelector('#fill').style.width=d.progress+'%';const c=d.counts;document.querySelector('#counts').textContent=`${c.done||0} done · ${c.pending||0} waiting · ${c.dead||0} failed · ${d.rate||0} files/sec`;const links=document.querySelector('#results');links.replaceChildren();for(const f of d.files){const a=document.createElement('a');a.href='/api/results/'+encodeURIComponent(f);a.textContent='Download '+f;links.append(a)}if(d.files.some(f=>f.startsWith('certificates-part-')))links.append(xlsxLink(),zipLink());const active=['running','paused','stopping'].includes(d.state);document.querySelector('#pause').disabled=!['running','paused'].includes(d.state);document.querySelector('#pause').textContent=d.state==='paused'?'Resume':'Pause';document.querySelector('#stop').disabled=!['running','paused'].includes(d.state);if(d.error){msg.textContent=d.error;msg.className='error'}}catch(_){}}
 async function refreshRows(force=false){try{const r=await fetch('/api/rows?view='+currentView);if(!r.ok)return;const d=await r.json(),revision=currentView+':'+d.revision;if(!force&&revision===rowsRevision)return;rowsRevision=revision;selectedIds.clear();updateSelected();const body=document.querySelector('#result-rows');body.replaceChildren();document.querySelector('#record-count').textContent=currentView==='failed'?`${d.total} failed files`:`${d.total} records`;for(let i=0;i<d.rows.length;i++){const x=d.rows[i],tr=document.createElement('tr');tr.dataset.id=x.id||'';if(x.tag)tr.classList.add(x.tag);const vals={idx:x.idx||i+1,file:x.file,company:x.company,folio:x.folio,regfolio:x.regfolio,cert:x.cert,holder:x.holder,shares:x.shares,facevalue:x.facevalue,sharetype:x.sharetype,distinctive:x.distinctive,date:x.date,latest:x.latest,latestfolio:x.latestfolio,foliohistory:x.foliohistory,holderhistory:x.holderhistory,remarks:x.remarks,flags:x.flags};for(const key of ['idx','file','company','folio','regfolio','cert','holder','shares','facevalue','sharetype','distinctive','date','latest','latestfolio','foliohistory','holderhistory','remarks','flags']){const td=document.createElement('td'),content=document.createElement('div');content.className='cell-text';if(key==='file'){const a=document.createElement('a');a.href=x.file_url;a.target='_blank';a.rel='noopener';a.textContent=vals[key]||'';content.append(a)}else content.textContent=vals[key]??'';content.title=content.textContent;td.append(content);tr.append(td)}body.append(tr)}}catch(_){}}
 setInterval(refresh,2500);setInterval(()=>refreshRows(),2500);refresh();refreshRows();</script></body></html>'''
 
