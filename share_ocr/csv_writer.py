@@ -54,12 +54,18 @@ def set_link_resolver(fn: Optional[Callable[[str], Optional[str]]]) -> None:
     _link_resolver = fn
 
 
+def link_target(path: Optional[str]) -> Optional[str]:
+    """What a Source File link should point at for this scan path."""
+    if path and _link_resolver:
+        return _link_resolver(path) or path
+    return path
+
+
 def hyperlink_cell(path: Optional[str], display: str) -> str:
     """A Source File cell that opens `path` when clicked in Excel, showing
     `display` as the visible text. Falls back to plain `display` text when
     there is no path to link to (older shards never recorded one)."""
-    if path and _link_resolver:
-        path = _link_resolver(path) or path
+    path = link_target(path)
     if not path:
         return display
     esc = lambda s: (s or "").replace('"', '""')           # noqa: E731
@@ -77,6 +83,41 @@ def parse_hyperlink_cell(value: str):
     if not m:
         return None, value
     return m.group(1).replace('""', '"'), m.group(2).replace('""', '"')
+
+
+# ------------------------------------------------------ Excel text guard --
+# Excel re-types CSV values as it opens them: folio "2/67" becomes the date
+# Feb-67, certificate "0201" loses its zero and becomes 201, a distinctive
+# number past 15 digits gets rounded. Such values are written as ="2/67",
+# which Excel shows as the exact text. Values starting with = + @ (formula
+# injection from an odd OCR result) get a leading apostrophe instead.
+_MONTHS = r"(?:jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)[a-z]*"
+_EXCEL_RETYPED = re.compile(
+    r"^(?:0\d+"                                   # leading zero
+    r"|\d{16,}"                                   # past Excel's precision
+    r"|[\d\s./:-]*[/:-][\d\s./:-]*"               # 2/67, 3-1342, 12-05-1967
+    r"|\d{1,2}\.\d{1,2}\.\d{2,4}"                 # 12.05.1967
+    r"|\d+(?:\.\d+)?e[+-]?\d+"                    # 1E5 (scientific)
+    r"|(?:\d{1,2}[\s/.-]*)?" + _MONTHS + r"[\s/.,-]*\d{0,4}"  # Aug-91
+    r")$", re.IGNORECASE)
+_EXCEL_TEXT_RE = re.compile(r'^="((?:[^"]|"")*)"$', re.DOTALL)
+
+
+def excel_text(value) -> str:
+    """`value` in a form Excel shows exactly as written when opening the CSV."""
+    s = "" if value is None else str(value)
+    if s[:1] in ("=", "+", "@"):
+        return "'" + s
+    if len(s) <= 250 and _EXCEL_RETYPED.match(s.strip()):
+        return '="%s"' % s.replace('"', '""')
+    return s
+
+
+def plain_value(value) -> str:
+    """Undo excel_text()'s ="..." wrapper when reading a CSV cell back."""
+    s = "" if value is None else str(value)
+    m = _EXCEL_TEXT_RE.match(s)
+    return m.group(1).replace('""', '"') if m else s
 
 
 def display_name(value: str) -> str:
@@ -241,7 +282,7 @@ class ShardedCsvWriter:
 
         def sig(r):
             return (display_name(str(r.get(SOURCE_FILE_HEADER, ""))),
-                    str(r.get(CERT_NO_HEADER, "")))
+                    plain_value(r.get(CERT_NO_HEADER, "")))
 
         kept = [r for r in rows if sig(r) not in sigset]
         removed = len(rows) - len(kept)
@@ -314,7 +355,7 @@ class ShardedCsvWriter:
             with p.open("r", encoding="utf-8-sig", newline="") as f:
                 for old in csv.DictReader(f):
                     row = self._migrate_row(old)
-                    ws.append([row.get(h, "") for h in CSV_COLUMNS])
+                    ws.append([plain_value(row.get(h, "")) for h in CSV_COLUMNS])
                     cell = ws.cell(row=ws.max_row, column=link_col)
                     link_path, display = parse_hyperlink_cell(cell.value)
                     cell.value = display
@@ -343,8 +384,7 @@ def record_to_row(rec: Dict, *, name: str, source_path: Optional[str] = None) ->
         elif src == "@extracted_at":
             row[header] = extracted_at
         else:
-            v = rec.get(src)
-            row[header] = "" if v is None else v
+            row[header] = excel_text(rec.get(src))
     return row
 
 
@@ -414,7 +454,7 @@ def write_failed_report(dest: Path, failures, max_attempts: int) -> int:
                 " ".join(str(r["error"] or "").split()),
                 f"{r['attempts']}/{max_attempts}",
                 when,
-                r["path"],
+                link_target(r["path"]),
             ])
     os.replace(tmp, dest)
     return len(rows)

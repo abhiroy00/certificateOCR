@@ -2,9 +2,11 @@
 from __future__ import annotations
 
 import hmac
+import io
 import json
 import os
 import secrets
+import tempfile
 import threading
 import time
 import uuid
@@ -18,7 +20,7 @@ from waitress import serve
 
 from .config import SUPPORTED_EXT, Settings
 from . import db
-from .csv_writer import set_link_resolver
+from .csv_writer import ShardedCsvWriter, set_link_resolver
 from .otp_auth import (MAX_ATTEMPTS, OTP_TTL_SECONDS,
                        RESEND_COOLDOWN_SECONDS, OtpChallenge, OtpMailError,
                        generate_otp, is_valid_email, send_otp_email)
@@ -58,14 +60,44 @@ def _sign(rel: str) -> str:
     return hmac.new(key, rel.encode("utf-8"), "sha256").hexdigest()[:32]
 
 
+# Per upload job: {path under UPLOADS_ROOT: path of the same file on the
+# user's PC}, written when the user names the folder their scans are in.
+LOCAL_LINKS_NAME = ".local_links.json"
+_local_links: dict[str, dict] = {}
+
+
+def _local_path(rel: str) -> str | None:
+    job = rel.split("/", 1)[0]
+    links = _local_links.get(job)
+    if links is None:
+        try:
+            links = json.loads((UPLOADS_ROOT / job / LOCAL_LINKS_NAME).read_text("utf-8"))
+        except (OSError, ValueError):
+            links = {}
+        _local_links[job] = links
+    return links.get(rel)
+
+
+def _join_local(folder: str, rel: str) -> str:
+    """`rel` (a/b.pdf) under the user's folder, in that folder's own style."""
+    windows = "\\" in folder or (len(folder) > 1 and folder[1] == ":")
+    sep = "\\" if windows else "/"
+    parts = [p for p in rel.replace("\\", "/").split("/") if p not in {"", ".", ".."}]
+    return folder.rstrip("\\/") + sep + sep.join(parts)
+
+
 def _scan_link(path: str) -> str | None:
-    """Signed http:// link to an uploaded scan, so the file name in the
-    downloaded CSV opens from Excel on the user's PC (a server path cannot)."""
-    if not _public_base:
-        return None
+    """Where the file name in the downloaded CSV/Excel points: the same scan
+    on the user's own PC when they gave its folder, otherwise a signed
+    http:// link to this server (a server path cannot open from Excel)."""
     try:
         rel = Path(path).resolve().relative_to(UPLOADS_ROOT.resolve()).as_posix()
     except ValueError:
+        return None
+    local = _local_path(rel)
+    if local:
+        return local
+    if not _public_base:
         return None
     return f"{_public_base}/scan/{quote(rel)}?k={_sign(rel)}"
 
@@ -373,8 +405,18 @@ def run_job():
             return jsonify({"error": "An OCR job is already running."}), 409
 
         uploads = request.files.getlist("files") + request.files.getlist("folder_files")
+        # Each file's path inside the folder the user picked (same order as
+        # the uploads), used only for links to their local copies.
+        try:
+            rel_paths = json.loads(request.form.get("rel_paths", "[]"))
+        except ValueError:
+            rel_paths = []
+        if not isinstance(rel_paths, list) or len(rel_paths) != len(uploads):
+            rel_paths = [None] * len(uploads)
+        local_folder = "".join(ch for ch in request.form.get("local_folder", "")
+                               if ch.isprintable()).strip()[:260]
         allowed = {ext.lower() for ext in SUPPORTED_EXT}
-        uploads = [f for f in uploads if f.filename and
+        uploads = [(f, r) for f, r in zip(uploads, rel_paths) if f.filename and
                    Path(f.filename).suffix.lower() in allowed]
         if not uploads:
             return jsonify({"error": "Choose one or more PDF or image files."}), 400
@@ -384,7 +426,8 @@ def run_job():
         folder = UPLOADS_ROOT / job_id
         folder.mkdir(parents=True, exist_ok=True)
         saved_paths = []
-        for item in uploads:
+        local_links = {}
+        for item, rel in uploads:
             name = _clean_name(item.filename)
             if not name:
                 continue
@@ -397,8 +440,15 @@ def run_job():
             target.parent.mkdir(parents=True, exist_ok=True)
             item.save(target)
             saved_paths.append(str(target))
+            if local_folder:
+                local_rel = rel if isinstance(rel, str) and rel.strip() else name
+                local_links[target.relative_to(UPLOADS_ROOT).as_posix()] = \
+                    _join_local(local_folder, local_rel)
         if not saved_paths:
             return jsonify({"error": "No supported documents were uploaded."}), 400
+        if local_links:
+            (folder / LOCAL_LINKS_NAME).write_text(json.dumps(local_links), "utf-8")
+            _local_links[job_id] = local_links
 
         s = Settings.load()
         engine = request.form.get("engine", "openai")
@@ -449,6 +499,25 @@ def result_file(name: str):
     return send_file(path, as_attachment=True, download_name=name)
 
 
+@app.get("/api/results-xlsx")
+def result_xlsx():
+    """Every result in one .xlsx: values stay exactly as extracted (no
+    date/number re-typing) and the file name is a real hyperlink, so its
+    address does not show in the formula bar."""
+    s = Settings.load()
+    if not any(s.csv_dir.glob("certificates-part-*.csv")):
+        abort(404)
+    fd, tmp = tempfile.mkstemp(suffix=".xlsx")
+    os.close(fd)
+    try:
+        ShardedCsvWriter(s.csv_dir, s.csv_shard_rows, s.csv_flush_rows).merge_into_excel(Path(tmp))
+        data = io.BytesIO(Path(tmp).read_bytes())
+    finally:
+        os.unlink(tmp)
+    return send_file(data, as_attachment=True, download_name="certificates.xlsx",
+                     mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+
+
 LOGIN_PAGE = r'''<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="csrf-token" content="__CSRF__"><title>Share Certificate OCR - Sign in</title>
@@ -474,7 +543,7 @@ PAGE = r'''<!doctype html>
 </style></head><body><main class="wrap"><div class="row"><div><div class="brand">SHARE CERTIFICATE OCR</div><h1>Share Certificate OCR</h1><p>Upload scans, extract details and review results.</p></div><div class="toolbar"><button class="secondary" id="api-keys" type="button">API keys</button><button class="secondary" id="output-folder" type="button">Output folder</button><button id="logout" type="button">Sign out</button></div></div>
 <div id="modal" class="modal" hidden><section class="modal-card"><div class="row"><h2 id="modal-title">Settings</h2><button class="secondary" id="modal-close" type="button">Close</button></div><div id="modal-content"></div></section></div>
 <section class="card"><form id="form"><div class="drop" id="drop"><strong>Choose certificates</strong><p>PDF, PNG, JPG, TIFF, WEBP or BMP. You can select multiple files.</p><input id="files" name="files" type="file" accept=".pdf,.png,.jpg,.jpeg,.tif,.tiff,.webp,.bmp" multiple><input id="folder-files" name="folder_files" type="file" webkitdirectory directory multiple hidden></div>
-<div class="controls"><label>OCR engine<select name="engine"><option value="openai">OpenAI vision (OpenAI + NVIDIA key pool)</option><option value="tesseract">Offline Tesseract</option></select></label><label>Workers<input name="workers" type="number" min="1" max="16" value="8"></label><button id="submit">Extract</button><button class="secondary" id="pick-folder" type="button">Select folder</button><button class="secondary" id="pause" type="button" disabled>Pause</button><button class="danger" id="stop" type="button" disabled>Stop</button><span class="muted" id="chosen">Nothing selected</span></div><div class="previews" id="previews" hidden></div></form><p class="muted">OpenAI mode uses server-configured API keys. Scans stay on this EC2 server.</p><div id="message"></div></section>
+<div class="controls"><label>OCR engine<select name="engine"><option value="openai">OpenAI vision (OpenAI + NVIDIA key pool)</option><option value="tesseract">Offline Tesseract</option></select></label><label>Workers<input name="workers" type="number" min="1" max="16" value="8"></label><label title="Optional. If the scans are also on your PC, enter the folder they are in (the folder you select, or where the chosen files are). Excel links will then open them from your PC instead of from this server.">Scans folder on your PC (optional)<input name="local_folder" id="local-folder" type="text" placeholder="e.g. D:\Certificates" style="padding:10px;border:1px solid #ccd6e4;border-radius:9px;min-width:230px"></label><button id="submit">Extract</button><button class="secondary" id="pick-folder" type="button">Select folder</button><button class="secondary" id="pause" type="button" disabled>Pause</button><button class="danger" id="stop" type="button" disabled>Stop</button><span class="muted" id="chosen">Nothing selected</span></div><div class="previews" id="previews" hidden></div></form><p class="muted">OpenAI mode uses server-configured API keys. Scans stay on this EC2 server.</p><div id="message"></div></section>
 <section class="card"><div class="row"><h2>Job status</h2><span class="pill" id="state">Ready</span></div><div class="bar"><div class="fill" id="fill"></div></div><p id="counts">No job started yet.</p><div class="files export-links" id="results"></div></section>
 <section class="card"><div class="row"><h2 class="table-title">Results <span class="pill" id="record-count">0 records</span></h2><div class="result-controls"><label><input type="radio" name="view" value="all" checked>All</label><label><input type="radio" name="view" value="failed">Failed</label></div></div><div class="row muted" style="justify-content:flex-start;margin:10px 0"><span><i class="legend addon"></i> add-on not captured</span><span><i class="legend flagged"></i> needs review</span><span id="selected-count" style="margin-left:auto">Nothing selected</span></div><div class="actions"><button class="secondary" id="select-all" type="button">Select all</button><button class="danger" id="delete-selected" type="button">Delete selected</button><button class="danger" id="clear-all" type="button">Clear all</button><span class="spacer"></span><span class="muted">Click a file name to open its uploaded scan.</span></div><div class="table-wrap"><table><thead><tr><th>#</th><th>File</th><th>Name of Share</th><th>Folio No</th><th>Registered Folio No</th><th>Certificate No</th><th>Name of Share Holder</th><th>No of Shares</th><th>Face Value / Share</th><th>Share Type</th><th>Distinctive No</th><th>Date of Issue</th><th>Latest Share Holder</th><th>Latest Folio No</th><th>Folio No History</th><th>Share Holder History</th><th>Remarks</th><th>Flags</th></tr></thead><tbody id="result-rows"></tbody></table></div></section>
 </main><script>const csrf=document.querySelector('meta[name=csrf-token]').content,msg=document.querySelector('#message');
@@ -486,7 +555,7 @@ document.querySelector('#modal-close').addEventListener('click',()=>document.que
 document.querySelector('#modal').addEventListener('click',e=>{if(e.target.id==='modal')e.currentTarget.hidden=true});
 document.querySelector('#logout').addEventListener('click',async()=>{await post('/api/auth/logout');location.reload()});
 document.querySelector('#api-keys').addEventListener('click',async()=>{showModal('API keys');const box=document.querySelector('#modal-content');box.textContent='Loading key status…';try{const r=await fetch('/api/settings'),d=await r.json();box.replaceChildren();const grid=document.createElement('div');grid.className='key-counts';for(const p of Object.values(d.keys)){const card=document.createElement('div');card.className='key-count';const b=document.createElement('strong');b.textContent=p.label;const line=document.createElement('p');line.textContent=`${p.count} key(s) configured · ${p.source}`;card.append(b,line);grid.append(card)}const note=document.createElement('p');note.textContent='Multiple keys are supported. For safety, enter or change API keys on the EC2 server over SSH (or AWS Systems Manager), not in this HTTP browser page. Put keys in OPENAI_API_KEYS separated by commas; NVIDIA_API_KEYS is also supported. No code edit is needed.';box.append(grid,note)}catch(_){box.textContent='Could not read API key status.'}});
-document.querySelector('#output-folder').addEventListener('click',async()=>{showModal('Output folder');const box=document.querySelector('#modal-content');box.textContent='Loading output files…';try{const r=await fetch('/api/output'),d=await r.json();box.replaceChildren();if(!d.files.length){const empty=document.createElement('p');empty.textContent='No output files yet.';box.append(empty)}for(const f of d.files){const a=document.createElement('a');a.href='/api/results/'+encodeURIComponent(f);a.textContent='Download '+f;a.style.display='block';a.style.margin='10px 0';box.append(a)}}catch(_){box.textContent='Could not list output files.'}});
+document.querySelector('#output-folder').addEventListener('click',async()=>{showModal('Output folder');const box=document.querySelector('#modal-content');box.textContent='Loading output files…';try{const r=await fetch('/api/output'),d=await r.json();box.replaceChildren();if(!d.files.length){const empty=document.createElement('p');empty.textContent='No output files yet.';box.append(empty)}for(const f of d.files){const a=document.createElement('a');a.href='/api/results/'+encodeURIComponent(f);a.textContent='Download '+f;a.style.display='block';a.style.margin='10px 0';box.append(a)}if(d.files.some(f=>f.startsWith('certificates-part-'))){const x=xlsxLink();x.style.display='block';x.style.margin='10px 0';box.append(x)}}catch(_){box.textContent='Could not list output files.'}});
 function updateChosen(){const n=files.files.length+folderFiles.files.length;document.querySelector('#chosen').textContent=n?`${n} file(s) selected`:'Nothing selected';renderPreviews()}
 const PDFJS='https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/';let pdfjsReady=null,previewUrls=[],previewToken=0;
 function loadPdfJs(){if(!pdfjsReady)pdfjsReady=new Promise((res,rej)=>{const sc=document.createElement('script');sc.src=PDFJS+'pdf.min.js';sc.onload=()=>{pdfjsLib.GlobalWorkerOptions.workerSrc=PDFJS+'pdf.worker.min.js';res(pdfjsLib)};sc.onerror=()=>{pdfjsReady=null;rej(Error('pdf.js'))};document.head.append(sc)});return pdfjsReady}
@@ -497,7 +566,11 @@ async function renderPreviews(){const token=++previewToken,strip=document.queryS
 files.addEventListener('change',()=>{if(files.files.length)folderFiles.value='';updateChosen()});folderFiles.addEventListener('change',()=>{if(folderFiles.files.length)files.value='';updateChosen()});
 document.querySelector('#pick-folder').addEventListener('click',()=>folderFiles.click());
 document.querySelector('#drop').addEventListener('dragover',e=>e.preventDefault());document.querySelector('#drop').addEventListener('drop',e=>{e.preventDefault();folderFiles.value='';files.files=e.dataTransfer.files;updateChosen()});
-form.addEventListener('submit',async e=>{e.preventDefault();if(!files.files.length&&!folderFiles.files.length){msg.textContent='Select files or a folder first.';msg.className='error';return}const b=document.querySelector('#submit');b.disabled=true;msg.textContent='Uploading files…';msg.className='muted';try{const r=await fetch('/api/run',{method:'POST',headers:{'X-CSRF-Token':csrf},body:new FormData(form)}),d=await r.json();if(!r.ok)throw Error(d.error||'Upload failed');msg.textContent=`${d.queued} document(s) queued.`;msg.className='ok';document.querySelector('#pause').disabled=false;document.querySelector('#stop').disabled=false;refresh()}catch(err){msg.textContent=err.message;msg.className='error'}finally{b.disabled=false}});
+const localFolder=document.querySelector('#local-folder');try{localFolder.value=localStorage.getItem('localFolder')||''}catch(_){}
+localFolder.addEventListener('change',()=>{try{localStorage.setItem('localFolder',localFolder.value.trim())}catch(_){}});
+function relPaths(){return[...[...files.files].map(f=>f.name),...[...folderFiles.files].map(f=>(f.webkitRelativePath||'').split('/').slice(1).join('/')||f.name)]}
+function xlsxLink(){const a=document.createElement('a');a.href='/api/results-xlsx';a.textContent='Download Excel (.xlsx)';return a}
+form.addEventListener('submit',async e=>{e.preventDefault();if(!files.files.length&&!folderFiles.files.length){msg.textContent='Select files or a folder first.';msg.className='error';return}const b=document.querySelector('#submit');b.disabled=true;msg.textContent='Uploading files…';msg.className='muted';try{const r=await fetch('/api/run',{method:'POST',headers:{'X-CSRF-Token':csrf},body:(()=>{const fd=new FormData(form);fd.append('rel_paths',JSON.stringify(relPaths()));return fd})()}),d=await r.json();if(!r.ok)throw Error(d.error||'Upload failed');msg.textContent=`${d.queued} document(s) queued.`;msg.className='ok';document.querySelector('#pause').disabled=false;document.querySelector('#stop').disabled=false;refresh()}catch(err){msg.textContent=err.message;msg.className='error'}finally{b.disabled=false}});
 async function control(action){try{const r=await post('/api/actions/'+action),d=await r.json();if(!r.ok)throw Error(d.error);refresh()}catch(err){msg.textContent=err.message;msg.className='error'}}
 document.querySelector('#pause').addEventListener('click',()=>control(document.querySelector('#pause').textContent==='Pause'?'pause':'resume'));
 document.querySelector('#stop').addEventListener('click',()=>control('stop'));
@@ -507,7 +580,7 @@ function updateSelected(){const n=selectedIds.size;document.querySelector('#sele
 document.querySelector('#result-rows').addEventListener('click',e=>{if(e.target.closest('a'))return;const tr=e.target.closest('tr');if(!tr)return;const id=tr.dataset.id;if(selectedIds.has(id)){selectedIds.delete(id);tr.classList.remove('selected-row')}else{selectedIds.add(id);tr.classList.add('selected-row')}updateSelected()});
 document.querySelector('#delete-selected').addEventListener('click',async()=>{if(currentView==='failed'){msg.textContent='Failed files have no extracted rows to delete. They will be listed in the failed CSV.';msg.className='error';return}const ids=[...selectedIds];if(!ids.length){msg.textContent='Select one or more rows first.';msg.className='error';return}if(!confirm(`Delete ${ids.length} selected row(s)? The source files remain on the server and the rows will be removed from the results and CSV.`))return;try{const r=await post('/api/actions/delete',{row_ids:ids}),d=await r.json();if(!r.ok)throw Error(d.error);msg.textContent=`Deleted ${d.deleted} row(s).`;msg.className='ok';selectedIds.clear();rowsRevision=null;refreshRows(true);refresh()}catch(err){msg.textContent=err.message;msg.className='error'}});
 document.querySelector('#clear-all').addEventListener('click',async()=>{if(!confirm('Clear the queue, all extracted rows and CSV outputs? Uploaded original scans will remain on the server.'))return;try{const r=await post('/api/actions/clear'),d=await r.json();if(!r.ok)throw Error(d.error);selectedIds.clear();rowsRevision=null;msg.textContent='Cleared.';msg.className='ok';refreshRows(true);refresh()}catch(err){msg.textContent=err.message;msg.className='error'}});
-async function refresh(){try{const r=await fetch('/api/status');if(!r.ok)return;const d=await r.json();document.querySelector('#state').textContent=d.state;document.querySelector('#fill').style.width=d.progress+'%';const c=d.counts;document.querySelector('#counts').textContent=`${c.done||0} done · ${c.pending||0} waiting · ${c.dead||0} failed · ${d.rate||0} files/sec`;const links=document.querySelector('#results');links.replaceChildren();for(const f of d.files){const a=document.createElement('a');a.href='/api/results/'+encodeURIComponent(f);a.textContent='Download '+f;links.append(a)}const active=['running','paused','stopping'].includes(d.state);document.querySelector('#pause').disabled=!['running','paused'].includes(d.state);document.querySelector('#pause').textContent=d.state==='paused'?'Resume':'Pause';document.querySelector('#stop').disabled=!['running','paused'].includes(d.state);if(d.error){msg.textContent=d.error;msg.className='error'}}catch(_){}}
+async function refresh(){try{const r=await fetch('/api/status');if(!r.ok)return;const d=await r.json();document.querySelector('#state').textContent=d.state;document.querySelector('#fill').style.width=d.progress+'%';const c=d.counts;document.querySelector('#counts').textContent=`${c.done||0} done · ${c.pending||0} waiting · ${c.dead||0} failed · ${d.rate||0} files/sec`;const links=document.querySelector('#results');links.replaceChildren();for(const f of d.files){const a=document.createElement('a');a.href='/api/results/'+encodeURIComponent(f);a.textContent='Download '+f;links.append(a)}if(d.files.some(f=>f.startsWith('certificates-part-')))links.append(xlsxLink());const active=['running','paused','stopping'].includes(d.state);document.querySelector('#pause').disabled=!['running','paused'].includes(d.state);document.querySelector('#pause').textContent=d.state==='paused'?'Resume':'Pause';document.querySelector('#stop').disabled=!['running','paused'].includes(d.state);if(d.error){msg.textContent=d.error;msg.className='error'}}catch(_){}}
 async function refreshRows(force=false){try{const r=await fetch('/api/rows?view='+currentView);if(!r.ok)return;const d=await r.json(),revision=currentView+':'+d.revision;if(!force&&revision===rowsRevision)return;rowsRevision=revision;selectedIds.clear();updateSelected();const body=document.querySelector('#result-rows');body.replaceChildren();document.querySelector('#record-count').textContent=currentView==='failed'?`${d.total} failed files`:`${d.total} records`;for(let i=0;i<d.rows.length;i++){const x=d.rows[i],tr=document.createElement('tr');tr.dataset.id=x.id||'';if(x.tag)tr.classList.add(x.tag);const vals={idx:x.idx||i+1,file:x.file,company:x.company,folio:x.folio,regfolio:x.regfolio,cert:x.cert,holder:x.holder,shares:x.shares,facevalue:x.facevalue,sharetype:x.sharetype,distinctive:x.distinctive,date:x.date,latest:x.latest,latestfolio:x.latestfolio,foliohistory:x.foliohistory,holderhistory:x.holderhistory,remarks:x.remarks,flags:x.flags};for(const key of ['idx','file','company','folio','regfolio','cert','holder','shares','facevalue','sharetype','distinctive','date','latest','latestfolio','foliohistory','holderhistory','remarks','flags']){const td=document.createElement('td'),content=document.createElement('div');content.className='cell-text';if(key==='file'){const a=document.createElement('a');a.href=x.file_url;a.target='_blank';a.rel='noopener';a.textContent=vals[key]||'';content.append(a)}else content.textContent=vals[key]??'';content.title=content.textContent;td.append(content);tr.append(td)}body.append(tr)}}catch(_){}}
 setInterval(refresh,2500);setInterval(()=>refreshRows(),2500);refresh();refreshRows();</script></body></html>'''
 
