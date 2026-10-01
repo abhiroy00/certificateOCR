@@ -61,6 +61,52 @@ the EC2 role only needs `ssm:GetParameter` on `/share-ocr/*` (and KMS decrypt
 if using a customer-managed key). The instance role is separate from your
 local deploy credentials.
 
+### EC2 instance role — Permissions tab mein ye policy dikhni chahiye
+
+IAM → Roles → `<ec2-role-name>` → **Permissions** tab mein ye inline/managed
+policy honi chahiye (Resource mein apna region/account rakho — Mumbai ke
+liye `ap-south-1`):
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": ["ssm:GetParameter", "ssm:GetParameters"],
+      "Resource": "arn:aws:ssm:ap-south-1:*:parameter/share-ocr/*"
+    },
+    {
+      "Effect": "Allow",
+      "Action": ["kms:Decrypt"],
+      "Resource": "*",
+      "Condition": {"StringEquals": {"kms:ViaService": "ssm.ap-south-1.amazonaws.com"}}
+    }
+  ]
+}
+```
+
+Trust relationship (Trust relationships tab) mein ye hona chahiye:
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [{
+    "Effect": "Allow",
+    "Principal": {"Service": "ec2.amazonaws.com"},
+    "Action": "sts:AssumeRole"
+  }]
+}
+```
+
+Policy attach karne ke baad **30–60 second rukko** (IAM eventual consistency),
+phir EC2 terminal mein ye retry karo:
+
+```bash
+aws ssm get-parameter --region ap-south-1 --name /share-ocr/openai-keys --with-decryption --query Parameter.Value --output text
+aws ssm get-parameter --region ap-south-1 --name /share-ocr/smtp-password --with-decryption --query Parameter.Value --output text
+```
+
 ```powershell
 aws ssm put-parameter --region ap-south-1 --name /share-ocr/openai-keys `
   --type SecureString --overwrite --value "YOUR_OPENAI_KEY"
